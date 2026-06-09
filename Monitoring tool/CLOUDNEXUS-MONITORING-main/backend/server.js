@@ -1930,13 +1930,40 @@ class GCPService {
   }
 
   async verifyConnection() {
+    const auth = await this.getAuth();
+
+    // Try Cloud Resource Manager first (gives project name + number)
     try {
-      const auth = await this.getAuth();
-      const cloudresourcemanager = google.cloudresourcemanager({ version: 'v1', auth });
-      const res = await cloudresourcemanager.projects.get({ projectId: this.projectId });
+      const crm = google.cloudresourcemanager({ version: 'v1', auth });
+      const res = await crm.projects.get({ projectId: this.projectId });
       return { success: true, projectName: res.data.name, projectNumber: res.data.projectNumber };
-    } catch (e) {
-      return { success: false, error: e.message };
+    } catch (crmErr) {
+      const isApiDisabled = crmErr.message && (
+        crmErr.message.includes('has not been used') ||
+        crmErr.message.includes('is disabled') ||
+        crmErr.message.includes('SERVICE_DISABLED')
+      );
+      // Only fall back if the API is disabled — any other error (bad creds, wrong project) should fail
+      if (!isApiDisabled) return { success: false, error: crmErr.message };
+    }
+
+    // Fallback: verify via Compute API (commonly enabled on all GCP projects)
+    try {
+      const compute = google.compute({ version: 'v1', auth });
+      await compute.regions.list({ project: this.projectId, maxResults: 1 });
+      return { success: true, projectName: this.projectId, projectNumber: null };
+    } catch (computeErr) {
+      const isComputeDisabled = computeErr.message && (
+        computeErr.message.includes('has not been used') ||
+        computeErr.message.includes('is disabled')
+      );
+      if (isComputeDisabled) {
+        return {
+          success: false,
+          error: `Neither the Cloud Resource Manager API nor the Compute Engine API is enabled for project "${this.projectId}". Enable at least one at https://console.cloud.google.com/apis/library`,
+        };
+      }
+      return { success: false, error: computeErr.message };
     }
   }
 
@@ -3641,10 +3668,98 @@ const nodemailer = require('nodemailer');
 const cron = require('node-cron');
 
 const SMTP_USER = process.env.SMTP_USER || 'support@core5.co.in';
-const SMTP_PASS = process.env.SMTP_PASS || 'Core5support@8800';
-const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
-const SMTP_PORT = parseInt(process.env.SMTP_PORT || '587', 10);
+const SMTP_PASS = process.env.SMTP_PASS || 'JsC6DWiPJ7rv';
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.zoho.in';
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '465', 10);
 const SMTP_FROM = process.env.SMTP_FROM || `"CloudNexus Monitor" <${SMTP_USER}>`;
+
+// ── Razorpay ──────────────────────────────────────────────────────────────────
+const Razorpay            = require('razorpay');
+const RAZORPAY_KEY_ID     = process.env.RAZORPAY_KEY_ID     || 'rzp_test_SzR3zMr0VB5JJe';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'aDWZQB5VaysiQvDY2DO6KyRm';
+const razorpay = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+
+// ── Microsoft Graph / OneDrive Excel ──────────────────────────────────────────
+const MS_TENANT_ID     = process.env.MS_TENANT_ID     || '';
+const MS_CLIENT_ID     = process.env.MS_CLIENT_ID     || '';
+const MS_CLIENT_SECRET = process.env.MS_CLIENT_SECRET || '';
+const MS_USER_EMAIL    = process.env.MS_USER_EMAIL    || '';  // OneDrive owner's email
+const MS_EXCEL_PATH    = process.env.MS_EXCEL_PATH    || 'CloudNexus/Contact_Submissions.xlsx';
+
+const EXCEL_HEADERS = ['Name', 'Phone', 'Company', 'Email', 'Plan', 'Message', 'Submitted At'];
+
+async function getMSToken() {
+  const res = await fetch(
+    `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type:    'client_credentials',
+        client_id:     MS_CLIENT_ID,
+        client_secret: MS_CLIENT_SECRET,
+        scope:         'https://graph.microsoft.com/.default',
+      }).toString(),
+    }
+  );
+  const data = await res.json();
+  if (!data.access_token) {
+    throw new Error('MS token error: ' + (data.error_description || JSON.stringify(data)));
+  }
+  return data.access_token;
+}
+
+async function appendToOneDriveExcel({ name, phone, company, email, plan, message }) {
+  if (!MS_TENANT_ID || !MS_CLIENT_ID || !MS_CLIENT_SECRET || !MS_USER_EMAIL) {
+    logger.warn('[OneDrive] MS Graph credentials not configured — skipping Excel append.');
+    return;
+  }
+
+  const token = await getMSToken();
+  // Build base URL: users/{email}/drive/root:/{path to xlsx}
+  const base  = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(MS_USER_EMAIL)}/drive/root:/${MS_EXCEL_PATH.split('/').map(encodeURIComponent).join('/')}`;
+
+  // Find the next empty row
+  const rangeRes = await fetch(`${base}:/workbook/worksheets/Sheet1/usedRange(valuesOnly=true)`, {
+    headers: { 'Authorization': `Bearer ${token}` },
+  });
+
+  let nextRow = 2;
+  if (rangeRes.ok) {
+    const rangeData = await rangeRes.json();
+    const rowCount  = rangeData.rowCount || 0;
+    nextRow = rowCount + 1;
+
+    // Write header row if sheet is empty
+    if (rowCount === 0) {
+      await fetch(`${base}:/workbook/worksheets/Sheet1/range(address='A1:G1')`, {
+        method:  'PATCH',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ values: [EXCEL_HEADERS] }),
+      });
+      nextRow = 2;
+    }
+  } else {
+    const errBody = await rangeRes.text();
+    throw new Error(`Graph usedRange ${rangeRes.status}: ${errBody}`);
+  }
+
+  const now      = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+  const patchRes = await fetch(
+    `${base}:/workbook/worksheets/Sheet1/range(address='A${nextRow}:G${nextRow}')`,
+    {
+      method:  'PATCH',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ values: [[name || '', phone || '', company || '', email || '', plan || '', message || '', now]] }),
+    }
+  );
+
+  if (!patchRes.ok) {
+    const errBody = await patchRes.text();
+    throw new Error(`Graph PATCH ${patchRes.status}: ${errBody}`);
+  }
+  logger.info(`[OneDrive] Row appended to Excel for: ${email}`);
+}
 
 const SEVERITY_COLOR = { critical: '#dc2626', warning: '#d97706', info: '#2563eb' };
 const HEALTH_COLOR   = { healthy: '#16a34a', warning: '#d97706', critical: '#dc2626', unknown: '#6b7280' };
@@ -4837,6 +4952,198 @@ app.get('/api/aws/cwagent-status', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+
+// ── Contact Form ──────────────────────────────────────────────────────────────
+app.post('/api/contact', async (req, res) => {
+  const { name, phone, company, email, plan, message } = req.body || {};
+  if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
+
+  function row(label, val, color) {
+    if (!val) return '';
+    const c = color || '#1e293b';
+    return '<tr>'
+      + '<td style="padding:6px 0;font-size:13px;color:#94a3b8;width:110px;vertical-align:top;">' + label + '</td>'
+      + '<td style="padding:6px 0;font-size:13px;color:' + c + ';font-weight:600;">' + val + '</td>'
+      + '</tr>';
+  }
+  const detailRows = [
+    row('Company', company),
+    row('Plan', plan, '#2563eb'),
+    row('Phone', phone),
+    row('Email', email),
+    message ? '<tr><td style="padding:6px 0;font-size:13px;color:#94a3b8;vertical-align:top;">Message</td><td style="padding:6px 0;font-size:13px;color:#1e293b;">' + message + '</td></tr>' : '',
+  ].filter(Boolean).join('');
+
+  const html = '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+    + '<body style="margin:0;padding:0;background:#f1f5f9;font-family:Segoe UI,Arial,sans-serif;">'
+    + '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:48px 16px;">'
+    + '<tr><td align="center">'
+    + '<table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;">'
+
+    // Header
+    + '<tr><td style="background:#07111f;border-radius:16px 16px 0 0;padding:36px 40px;text-align:center;">'
+    + '<table cellpadding="0" cellspacing="0" style="margin:0 auto;"><tr>'
+    + '<td style="background:#2563eb;border-radius:8px;width:34px;height:34px;text-align:center;vertical-align:middle;"><span style="color:#fff;font-size:16px;font-weight:900;">C</span></td>'
+    + '<td style="padding-left:10px;font-size:21px;font-weight:800;color:#fff;letter-spacing:-0.5px;vertical-align:middle;">Cloud<span style="color:#60a5fa;">Nexus</span></td>'
+    + '</tr></table></td></tr>'
+
+    // Green confirmation banner
+    + '<tr><td style="background:#16a34a;padding:14px 40px;text-align:center;">'
+    + '<span style="font-size:14px;font-weight:700;color:#fff;">&#10003; &nbsp; Request Successfully Received</span>'
+    + '</td></tr>'
+
+    // Body
+    + '<tr><td style="background:#ffffff;padding:40px 40px 32px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
+    + '<h1 style="font-size:22px;font-weight:800;color:#0f172a;margin:0 0 10px;letter-spacing:-0.4px;">Hi ' + name + ', we got your message!</h1>'
+    + '<p style="font-size:14px;color:#475569;margin:0 0 28px;line-height:1.75;">Thank you for reaching out to <strong>CloudNexus</strong>. Our team has received your request and will connect with you within <strong>24 business hours</strong>.</p>'
+
+    // Details card
+    + '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:20px 24px;margin-bottom:32px;">'
+    + '<p style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin:0 0 14px;">Your Submission Details</p>'
+    + '<table cellpadding="0" cellspacing="0" style="width:100%;">' + detailRows + '</table>'
+    + '</div>'
+
+    // What next
+    + '<p style="font-size:14px;font-weight:700;color:#0f172a;margin:0 0 14px;">What happens next?</p>'
+    + '<table cellpadding="0" cellspacing="0" style="width:100%;margin-bottom:32px;">'
+    + '<tr><td style="vertical-align:top;padding:0 12px 14px 0;width:28px;"><div style="background:#eff6ff;color:#2563eb;border-radius:50%;width:24px;height:24px;text-align:center;line-height:24px;font-size:11px;font-weight:800;">1</div></td><td style="font-size:13px;color:#475569;line-height:1.65;padding-bottom:14px;">Our team reviews your request and prepares a tailored demo.</td></tr>'
+    + '<tr><td style="vertical-align:top;padding:0 12px 14px 0;"><div style="background:#eff6ff;color:#2563eb;border-radius:50%;width:24px;height:24px;text-align:center;line-height:24px;font-size:11px;font-weight:800;">2</div></td><td style="font-size:13px;color:#475569;line-height:1.65;padding-bottom:14px;">A CloudNexus specialist will reach out to schedule a <strong>personalized walkthrough</strong>.</td></tr>'
+    + '<tr><td style="vertical-align:top;padding:0 12px 0 0;"><div style="background:#eff6ff;color:#2563eb;border-radius:50%;width:24px;height:24px;text-align:center;line-height:24px;font-size:11px;font-weight:800;">3</div></td><td style="font-size:13px;color:#475569;line-height:1.65;">We will customize the session around your <strong>infrastructure and cost goals</strong>.</td></tr>'
+    + '</table>'
+    + '<div style="text-align:center;"><a href="http://localhost:3006" style="display:inline-block;background:#2563eb;color:#fff;font-size:14px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;">Explore CloudNexus</a></div>'
+    + '</td></tr>'
+
+    // Footer
+    + '<tr><td style="background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 16px 16px;padding:20px 40px;text-align:center;">'
+    + '<p style="font-size:12px;color:#94a3b8;margin:0 0 4px;">&copy; 2026 CloudNexus. All rights reserved.</p>'
+    + '<p style="font-size:12px;color:#cbd5e1;margin:0;">You received this because you submitted a demo request on CloudNexus.</p>'
+    + '</td></tr>'
+
+    + '</table></td></tr></table></body></html>';
+
+  const submittedAt = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+  const internalHtml = '<!DOCTYPE html><html><head><meta charset="utf-8"></head>'
+      + '<body style="margin:0;padding:0;background:#f1f5f9;font-family:Segoe UI,Arial,sans-serif;">'
+      + '<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:48px 16px;">'
+      + '<tr><td align="center">'
+      + '<table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;">'
+
+      // Header
+      + '<tr><td style="background:#07111f;border-radius:16px 16px 0 0;padding:28px 40px;text-align:center;">'
+      + '<table cellpadding="0" cellspacing="0" style="margin:0 auto;"><tr>'
+      + '<td style="background:#2563eb;border-radius:8px;width:34px;height:34px;text-align:center;vertical-align:middle;"><span style="color:#fff;font-size:16px;font-weight:900;">C</span></td>'
+      + '<td style="padding-left:10px;font-size:21px;font-weight:800;color:#fff;letter-spacing:-0.5px;vertical-align:middle;">Cloud<span style="color:#60a5fa;">Nexus</span></td>'
+      + '</tr></table>'
+      + '<p style="margin:12px 0 0;font-size:12px;color:rgba(255,255,255,0.5);letter-spacing:0.5px;text-transform:uppercase;">New Lead / Contact Request</p>'
+      + '</td></tr>'
+
+      // Orange banner
+      + '<tr><td style="background:#d97706;padding:12px 40px;text-align:center;">'
+      + '<span style="font-size:13px;font-weight:700;color:#fff;">&#128276; &nbsp; New enquiry submitted — ' + submittedAt + ' IST</span>'
+      + '</td></tr>'
+
+      // Body
+      + '<tr><td style="background:#ffffff;padding:36px 40px 32px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">'
+      + '<h2 style="font-size:18px;font-weight:800;color:#0f172a;margin:0 0 6px;">Lead Details</h2>'
+      + '<p style="font-size:13px;color:#64748b;margin:0 0 24px;">A visitor has submitted the Contact Us form on the CloudNexus website.</p>'
+
+      // Details table
+      + '<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:20px 24px;margin-bottom:24px;">'
+      + '<table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">'
+      + '<tr><td style="padding:8px 0;font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;width:120px;border-bottom:1px solid #f1f5f9;">Name</td><td style="padding:8px 0;font-size:14px;color:#0f172a;font-weight:700;border-bottom:1px solid #f1f5f9;">' + name + '</td></tr>'
+      + '<tr><td style="padding:8px 0;font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;border-bottom:1px solid #f1f5f9;">Email</td><td style="padding:8px 0;font-size:14px;font-weight:600;border-bottom:1px solid #f1f5f9;"><a href="mailto:' + email + '" style="color:#2563eb;text-decoration:none;">' + email + '</a></td></tr>'
+      + (phone ? '<tr><td style="padding:8px 0;font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;border-bottom:1px solid #f1f5f9;">Phone</td><td style="padding:8px 0;font-size:14px;color:#0f172a;font-weight:600;border-bottom:1px solid #f1f5f9;">' + phone + '</td></tr>' : '')
+      + (company ? '<tr><td style="padding:8px 0;font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;border-bottom:1px solid #f1f5f9;">Company</td><td style="padding:8px 0;font-size:14px;color:#0f172a;font-weight:600;border-bottom:1px solid #f1f5f9;">' + company + '</td></tr>' : '')
+      + (plan ? '<tr><td style="padding:8px 0;font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;border-bottom:1px solid #f1f5f9;">Plan</td><td style="padding:8px 0;border-bottom:1px solid #f1f5f9;"><span style="display:inline-block;background:#eff6ff;color:#2563eb;border:1px solid #bfdbfe;padding:3px 12px;border-radius:999px;font-size:13px;font-weight:700;">' + plan + '</span></td></tr>' : '')
+      + (message ? '<tr><td style="padding:8px 0;font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.6px;vertical-align:top;">Message</td><td style="padding:8px 0;font-size:14px;color:#334155;line-height:1.65;">' + message + '</td></tr>' : '')
+      + '</table>'
+      + '</div>'
+
+      + '<p style="font-size:12px;color:#94a3b8;margin:0;">Reply directly to this email or contact the lead at <a href="mailto:' + email + '" style="color:#2563eb;">' + email + '</a>.</p>'
+      + '</td></tr>'
+
+      // Footer
+      + '<tr><td style="background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 16px 16px;padding:16px 40px;text-align:center;">'
+      + '<p style="font-size:12px;color:#94a3b8;margin:0;">CloudNexus Admin Notification &mdash; ' + submittedAt + ' IST</p>'
+      + '</td></tr>'
+
+      + '</table></td></tr></table></body></html>';
+
+  try {
+    await reportService.transporter.sendMail({
+      from: SMTP_FROM,
+      to: email,
+      subject: "CloudNexus — We've received your request, " + name + "!",
+      html,
+    });
+    logger.info("Contact confirmation sent to " + email);
+
+    // Append to OneDrive Excel — runs in background, never blocks the response
+    appendToOneDriveExcel({ name, phone, company, email, plan, message })
+      .catch(err => logger.error('[OneDrive] Excel append failed: ' + err.message));
+
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error("Contact email failed: " + err.message);
+    res.status(500).json({ error: 'Failed to send email', details: err.message });
+  }
+
+  // Admin lead notification — isolated so it never affects the client-facing response
+  try {
+    await reportService.transporter.sendMail({
+      from: SMTP_FROM,
+      to: 'aniket.singh@core5.co.in',
+      replyTo: email,
+      subject: '[CloudNexus Lead] ' + name + (company ? ' (' + company + ')' : '') + (plan ? ' - ' + plan : ''),
+      html: internalHtml,
+    });
+    logger.info("Internal lead notification sent to aniket.singh@core5.co.in for enquiry from " + email);
+  } catch (adminErr) {
+    logger.error("Admin lead notification FAILED: " + adminErr.message);
+  }
+});
+
+
+// ── Razorpay: Create Order ────────────────────────────────────────────────────
+app.post('/api/create-order', async (req, res) => {
+  const { amount, currency = 'INR', receipt, plan_name } = req.body || {};
+  if (!amount || Number(amount) < 100) {
+    return res.status(400).json({ error: 'amount must be at least 100 paise (₹1)' });
+  }
+  try {
+    const order = await razorpay.orders.create({
+      amount:   Number(amount),
+      currency,
+      receipt:  receipt || `rcpt_${Date.now()}`,
+      notes:    { plan_name: plan_name || '' },
+    });
+    logger.info(`[Razorpay] Order created: ${order.id} for ${plan_name} ₹${amount / 100}`);
+    res.json({ order_id: order.id, amount: order.amount, currency: order.currency });
+  } catch (err) {
+    logger.error('[Razorpay] create-order failed: ' + err.message);
+    res.status(500).json({ error: 'Failed to create Razorpay order', details: err.message });
+  }
+});
+
+// ── Razorpay: Verify Payment Signature ───────────────────────────────────────
+app.post('/api/verify-payment', (req, res) => {
+  const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body || {};
+  if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+    return res.status(400).json({ error: 'Missing payment fields' });
+  }
+  const expected = crypto
+    .createHmac('sha256', RAZORPAY_KEY_SECRET)
+    .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+    .digest('hex');
+  if (expected !== razorpay_signature) {
+    logger.warn(`[Razorpay] Signature mismatch for order ${razorpay_order_id}`);
+    return res.status(400).json({ error: 'Signature mismatch — payment not verified' });
+  }
+  logger.info(`[Razorpay] Payment verified: ${razorpay_payment_id}`);
+  res.json({ ok: true, payment_id: razorpay_payment_id });
+});
+
 
 // â”€â”€â”€ WebSocket â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 io.on('connection', socket => {

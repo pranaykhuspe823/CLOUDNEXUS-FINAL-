@@ -16,6 +16,9 @@ const ChevronRight = () => (
 const XIcon = () => (
   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
 );
+const CheckIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+);
 
 const monitoringCards = [
   { image: "/images/monitoring_health.png", title: "Server Health Dashboard", desc: "Real-time CPU, memory, and disk monitoring across all your servers with automated health checks and instant anomaly detection." },
@@ -156,6 +159,36 @@ const makeNavItems = (onNavigate) => [
 export default function Landing({ onNavigate }) {
   const [scrolled, setScrolled] = useState(false);
   const [activeCarousel, setActiveCarousel] = useState(null);
+  const [bundleTab, setBundleTab] = useState("monitoring");
+  const [contactForm, setContactForm] = useState({ name: "", phone: "", company: "", email: "", plan: "", message: "" });
+  const [contactSent, setContactSent] = useState(false);
+  const [contactLoading, setContactLoading] = useState(false);
+  const [contactError, setContactError] = useState("");
+
+  function scrollToContact(plan = "") {
+    if (plan) setContactForm(prev => ({ ...prev, plan }));
+    setTimeout(() => document.getElementById("contact")?.scrollIntoView({ behavior: "smooth" }), 50);
+  }
+
+  async function handleContactSubmit(e) {
+    e.preventDefault();
+    setContactLoading(true);
+    setContactError("");
+    try {
+      const res = await fetch("/api/contact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(contactForm),
+      });
+      if (!res.ok) throw new Error((await res.json()).error || "Failed to send");
+      setContactSent(true);
+      setContactForm({ name: "", phone: "", company: "", email: "", plan: "", message: "" });
+    } catch (err) {
+      setContactError("Could not send your message. Please try again.");
+    } finally {
+      setContactLoading(false);
+    }
+  }
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 10);
@@ -181,6 +214,8 @@ export default function Landing({ onNavigate }) {
           <div className="nav-links">
             <a href="#solutions">Features</a>
             <a href="#solutions">Solutions</a>
+            <a href="#pricing">Pricing</a>
+            <a href="#contact">Contact Us</a>
           </div>
           <div className="nav-actions">
             <button className="btn btn-ghost btn-sm" onClick={() => onNavigate("auth")}>Sign in</button>
@@ -203,7 +238,7 @@ export default function Landing({ onNavigate }) {
             </p>
             <div className="hero-actions">
               <button className="btn btn-primary btn-xl" onClick={() => onNavigate("auth")}>Start Free Trial</button>
-              <button className="btn btn-secondary btn-xl">Book a Demo</button>
+              <button className="btn btn-secondary btn-xl" onClick={() => scrollToContact()}>Book a Demo</button>
             </div>
           </div>
           <div className="hero-visual">
@@ -314,16 +349,289 @@ export default function Landing({ onNavigate }) {
         </div>
       </section>
 
-      {/* CTA */}
-      <section className="cta-section">
+      {/* AI Capabilities */}
+      <section className="ai-section">
         <div className="section-container">
-          <div className="cta-card">
-            <h2>Ready to optimize your cloud?</h2>
-            <p>Join 2,000+ teams already saving an average of 35% on their cloud infrastructure costs.</p>
-            <div className="cta-actions">
-              <button className="btn btn-primary btn-xl" onClick={() => onNavigate("auth")}>Start Free Trial</button>
-              <button className="btn btn-secondary btn-xl">Talk to Sales</button>
+          <div className="section-header">
+            <div className="section-eyebrow">AI-Powered</div>
+            <h2 className="section-title">Three intelligent engines,<br />one unified platform</h2>
+            <p className="section-desc">Our AI suite goes beyond dashboards — it actively optimizes, analyses, and forecasts your cloud infrastructure.</p>
+          </div>
+          <div className="ai-cards">
+
+            {/* AI Optimizer */}
+            <div className="ai-card">
+              <div className="ai-card-visual ai-opt-visual">
+                <div className="ai-icon-glow ai-opt-glow" />
+                <div className="ai-icon-circle ai-opt-circle">
+                  <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+                  </svg>
+                </div>
+                <div className="ai-card-visual-label">AI Optimizer</div>
+              </div>
+              <div className="ai-card-body">
+                <div className="ai-card-tag ai-opt-tag">Cost Optimization</div>
+                <h3 className="ai-card-title">AI Optimizer</h3>
+                <p className="ai-card-desc">Automatically identifies and eliminates cloud waste. Our AI engine continuously analyzes resource utilization and recommends right-sizing actions to cut costs by up to 35%.</p>
+              </div>
             </div>
+
+            {/* AI Analyser */}
+            <div className="ai-card">
+              <div className="ai-card-visual ai-ana-visual">
+                <div className="ai-icon-glow ai-ana-glow" />
+                <div className="ai-icon-circle ai-ana-circle">
+                  <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+                    <path d="M11 8v3l2 2"/>
+                  </svg>
+                </div>
+                <div className="ai-card-visual-label">AI Analyser</div>
+              </div>
+              <div className="ai-card-body">
+                <div className="ai-card-tag ai-ana-tag">Deep Analytics</div>
+                <h3 className="ai-card-title">AI Analyser</h3>
+                <p className="ai-card-desc">Deep infrastructure intelligence at your fingertips. Correlate metrics across compute, network, and storage in real-time to pinpoint bottlenecks before they impact users.</p>
+              </div>
+            </div>
+
+            {/* AI Forecast */}
+            <div className="ai-card">
+              <div className="ai-card-visual ai-fore-visual">
+                <div className="ai-icon-glow ai-fore-glow" />
+                <div className="ai-icon-circle ai-fore-circle">
+                  <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#34d399" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="22 7 13.5 15.5 8.5 10.5 2 17"/>
+                    <polyline points="16 7 22 7 22 13"/>
+                  </svg>
+                </div>
+                <div className="ai-card-visual-label">AI Forecast</div>
+              </div>
+              <div className="ai-card-body">
+                <div className="ai-card-tag ai-fore-tag">Budget Forecasting</div>
+                <h3 className="ai-card-title">AI Forecast</h3>
+                <p className="ai-card-desc">Predict your cloud spend 90 days ahead with confidence. ML models trained on your usage patterns deliver accurate budget projections and proactive spend alerts.</p>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </section>
+
+      {/* Pricing */}
+      <section className="pricing-section" id="pricing">
+        <div className="section-container">
+          <div className="section-header">
+            <div className="section-eyebrow">Pricing</div>
+            <h2 className="section-title">Plans for every team</h2>
+            <p className="section-desc">Start with what you need. Scale as you grow — no hidden fees, no surprises.</p>
+          </div>
+
+          <div className="pricing-grid">
+
+            {/* Bundle card — toggle between Monitoring & Billing */}
+            <div className="pricing-card bundle-card">
+              <div className="bundle-toggle">
+                <button className={`bundle-tab ${bundleTab === "monitoring" ? "active" : ""}`} onClick={() => setBundleTab("monitoring")}>Monitoring</button>
+                <button className={`bundle-tab ${bundleTab === "billing" ? "active" : ""}`} onClick={() => setBundleTab("billing")}>Billing</button>
+              </div>
+              <div key={bundleTab} className="bundle-plan-content">
+                <div className="pc-name">
+                  {bundleTab === "monitoring" ? "Monitoring Bundle" : "Billing Bundle"}
+                </div>
+                <div className="pc-price-wrap">
+                  <span className="pc-price">₹10,000</span>
+                  <span className="pc-period">per user / year</span>
+                </div>
+                <p className="pc-desc">
+                  {bundleTab === "monitoring"
+                    ? "Perfect for teams focused on infrastructure health, real-time alerting, and server analytics."
+                    : "Ideal for teams tracking cloud costs, managing invoices, and optimizing spend."}
+                </p>
+                <ul className="pc-features">
+                  {(bundleTab === "monitoring"
+                    ? ["1 Admin + 1 User", "Monitoring Module Access", "Real-time Alerts & Dashboards", "Server & Network Health", "Email Support"]
+                    : ["1 Admin + 1 User", "Billing Module Access", "Cost Analytics & Forecasting", "Invoice & Budget Management", "Email Support"]
+                  ).map(f => <li key={f}><CheckIcon />{f}</li>)}
+                </ul>
+                <button className="btn btn-secondary btn-lg pc-btn" onClick={() => onNavigate("auth")}>
+                  Get Started <ArrowRight />
+                </button>
+              </div>
+            </div>
+
+            {/* Standard Pro */}
+            <div className="pricing-card">
+              <div className="pc-name">Standard Pro</div>
+              <div className="pc-price-wrap">
+                <span className="pc-price pc-contact">Contact Us</span>
+              </div>
+              <p className="pc-desc">For growing teams that need full access to both monitoring and billing in one plan.</p>
+              <ul className="pc-features">
+                {["2 Admins Included", "Monitoring & Billing Access", "Full Dashboard Suite", "Custom Alert Policies", "Priority Email Support"].map(f => (
+                  <li key={f}><CheckIcon />{f}</li>
+                ))}
+              </ul>
+              <button className="btn btn-secondary btn-lg pc-btn" onClick={() => scrollToContact("Standard Pro")}>
+                Contact Sales <ArrowRight />
+              </button>
+            </div>
+
+            {/* Professional — highlighted */}
+            <div className="pricing-card pricing-highlight">
+              <div className="pc-badge">Most Popular</div>
+              <div className="pc-name">Professional</div>
+              <div className="pc-price-wrap">
+                <span className="pc-price pc-contact">Contact Us</span>
+              </div>
+              <p className="pc-desc">Scale your team with multi-user access and advanced analytics across all modules.</p>
+              <ul className="pc-features">
+                {["2 Admins + 3 Users per Module", "Full Platform Access", "Advanced Analytics & Reports", "Dedicated Account Manager", "API Access & Integrations"].map(f => (
+                  <li key={f}><CheckIcon />{f}</li>
+                ))}
+              </ul>
+              <button className="btn btn-primary btn-lg pc-btn" onClick={() => scrollToContact("Professional")}>
+                Contact Sales <ArrowRight />
+              </button>
+            </div>
+
+            {/* Enterprise */}
+            <div className="pricing-card">
+              <div className="pc-name">Enterprise</div>
+              <div className="pc-price-wrap">
+                <span className="pc-price pc-contact">Contact Us</span>
+              </div>
+              <p className="pc-desc">Unlimited scale, custom integrations, and white-glove support for large organizations.</p>
+              <ul className="pc-features">
+                {["Unlimited Users", "Full Platform Access", "Custom Integrations & SSO", "24/7 Priority Support", "SLA Guarantee"].map(f => (
+                  <li key={f}><CheckIcon />{f}</li>
+                ))}
+              </ul>
+              <button className="btn btn-secondary btn-lg pc-btn" onClick={() => scrollToContact("Enterprise")}>
+                Contact Sales <ArrowRight />
+              </button>
+            </div>
+
+          </div>
+        </div>
+      </section>
+
+      {/* Contact Us */}
+      <section className="contact-section" id="contact">
+        <div className="section-container">
+          <div className="contact-inner">
+
+            {/* Left — info */}
+            <div className="contact-info">
+              <div className="contact-badge">Get in Touch</div>
+              <h2>See CloudNexus<br />in Action</h2>
+              <p className="contact-info-sub">
+                Top Cloud Management Platform, trusted by engineering teams worldwide. Let our experts walk you through everything CloudNexus can do for your infrastructure.
+              </p>
+              <ul className="contact-perks">
+                {[
+                  "Live walkthrough of our cloud management platform",
+                  "Insights on how our solutions align with your business challenges",
+                  "Personalized recommendations for cost optimization and efficiency",
+                  "Q&A session with our cloud infrastructure specialists",
+                ].map(p => (
+                  <li key={p}>
+                    <CheckIcon />
+                    {p}
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            {/* Right — form */}
+            <div className="contact-form-card">
+              {contactSent ? (
+                <div className="cf-success">
+                  <div className="cf-success-icon">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#22c55e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                  </div>
+                  <h3>Message Sent!</h3>
+                  <p>Thank you for reaching out. Our team will get back to you within 24 hours.</p>
+                  <button className="cf-reset" onClick={() => setContactSent(false)}>Send another message</button>
+                </div>
+              ) : (
+                <form onSubmit={handleContactSubmit}>
+                  <div className="contact-form-title">Start Securing Your Business Today!</div>
+                  <div className="cf-row">
+                    <div className="cf-field">
+                      <input
+                        className="cf-input"
+                        type="text"
+                        placeholder="Full Name"
+                        value={contactForm.name}
+                        onChange={e => setContactForm(p => ({ ...p, name: e.target.value }))}
+                        required
+                      />
+                    </div>
+                    <div className="cf-field">
+                      <input
+                        className="cf-input"
+                        type="tel"
+                        placeholder="Contact No."
+                        value={contactForm.phone}
+                        onChange={e => setContactForm(p => ({ ...p, phone: e.target.value }))}
+                      />
+                    </div>
+                  </div>
+                  <div className="cf-field">
+                    <input
+                      className="cf-input"
+                      type="text"
+                      placeholder="Company"
+                      value={contactForm.company}
+                      onChange={e => setContactForm(p => ({ ...p, company: e.target.value }))}
+                    />
+                  </div>
+                  <div className="cf-field">
+                    <input
+                      className="cf-input"
+                      type="email"
+                      placeholder="Work Email"
+                      value={contactForm.email}
+                      onChange={e => setContactForm(p => ({ ...p, email: e.target.value }))}
+                      required
+                    />
+                  </div>
+                  <div className="cf-field">
+                    <select
+                      className="cf-input cf-select"
+                      value={contactForm.plan}
+                      onChange={e => setContactForm(p => ({ ...p, plan: e.target.value }))}
+                    >
+                      <option value="">Select a Plan</option>
+                      <option value="Monitoring Bundle">Monitoring Bundle</option>
+                      <option value="Billing Bundle">Billing Bundle</option>
+                      <option value="Standard Pro">Standard Pro</option>
+                      <option value="Professional">Professional</option>
+                      <option value="Enterprise">Enterprise</option>
+                    </select>
+                  </div>
+                  <div className="cf-field">
+                    <textarea
+                      className="cf-input cf-textarea"
+                      placeholder="Tell us briefly what you are looking for in CloudNexus..."
+                      value={contactForm.message}
+                      onChange={e => setContactForm(p => ({ ...p, message: e.target.value }))}
+                    />
+                  </div>
+                  {contactError && (
+                    <p className="cf-error">{contactError}</p>
+                  )}
+                  <button type="submit" className="cf-submit" disabled={contactLoading}>
+                    {contactLoading ? (
+                      <><span className="cf-spinner" /> Sending...</>
+                    ) : "Schedule a Free Demo Today"}
+                  </button>
+                </form>
+              )}
+            </div>
+
           </div>
         </div>
       </section>
