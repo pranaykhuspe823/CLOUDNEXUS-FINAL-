@@ -74,6 +74,10 @@ const ACTIVITY_KEY = "cn_user_activity";
 const PROFILE_KEY  = "cn_admin_profile";
 const SETTINGS_KEY = "cn_settings";
 
+function getUserPhoto(email) {
+  try { return localStorage.getItem(`cn_user_photo_${email}`) || null; } catch { return null; }
+}
+
 function getGlobalSettings() {
   try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); } catch { return {}; }
 }
@@ -880,16 +884,22 @@ export default function AdminPortal({ admin, onLogout }) {
                   const activeDuration = online && act?.sessionStart
                     ? Date.now() - act.sessionStart : null;
                   const lastDuration = act?.lastSessionDuration || null;
+                  const photo   = getUserPhoto(u.email);
 
                   return (
                     <tr key={u.id}>
                       {/* User */}
                       <td>
                         <div className="ap-user-cell">
-                          <div className="ap-user-avatar" style={{background: online
-                            ? "linear-gradient(135deg,#16a34a,#22c55e)"
-                            : "linear-gradient(135deg,#94a3b8,#64748b)"}}>
-                            {u.name[0].toUpperCase()}
+                          <div className="ap-user-avatar" style={{
+                            background: photo ? "transparent" : online
+                              ? "linear-gradient(135deg,#16a34a,#22c55e)"
+                              : "linear-gradient(135deg,#94a3b8,#64748b)",
+                            overflow: "hidden", padding: 0,
+                          }}>
+                            {photo
+                              ? <img src={photo} alt={u.name} style={{width:"100%",height:"100%",objectFit:"cover",display:"block",borderRadius:8}} />
+                              : u.name[0].toUpperCase()}
                           </div>
                           <div>
                             <div style={{fontWeight:700,color:"#0f172a",fontSize:13}}>{u.name}</div>
@@ -996,9 +1006,18 @@ export default function AdminPortal({ admin, onLogout }) {
               </th>
             </tr></thead>
             <tbody>
-              {users.map(u => (
+              {users.map(u => {
+                const photo = getUserPhoto(u.email);
+                return (
                 <tr key={u.id}>
-                  <td><div className="ap-user-cell"><div className="ap-user-avatar">{u.name[0].toUpperCase()}</div><span style={{fontWeight:600,color:"#0f172a"}}>{u.name}</span></div></td>
+                  <td><div className="ap-user-cell">
+                    <div className="ap-user-avatar" style={{overflow:"hidden",padding:0,background:photo?"transparent":undefined}}>
+                      {photo
+                        ? <img src={photo} alt={u.name} style={{width:"100%",height:"100%",objectFit:"cover",display:"block",borderRadius:8}} />
+                        : u.name[0].toUpperCase()}
+                    </div>
+                    <span style={{fontWeight:600,color:"#0f172a"}}>{u.name}</span>
+                  </div></td>
                   <td style={{color:"#64748b"}}>{u.email}</td>
                   <td>
                     {monAllowed ? (
@@ -1025,7 +1044,8 @@ export default function AdminPortal({ admin, onLogout }) {
                     )}
                   </td>
                 </tr>
-              ))}
+              );
+              })}
             </tbody>
           </table>
         )}

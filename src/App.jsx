@@ -74,7 +74,12 @@ const hubCss = `
 .hub-logo-icon { width: 32px; height: 32px; background: var(--blue-600); border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-right: 10px; }
 .hub-logo span { color: var(--blue-600); }
 .hub-user-row { display: flex; align-items: center; gap: 16px; }
-.hub-avatar { width: 38px; height: 38px; border-radius: 10px; background: linear-gradient(135deg, #2563eb, #6366f1); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; color: #fff; flex-shrink: 0; }
+.hub-avatar { width: 38px; height: 38px; border-radius: 10px; background: linear-gradient(135deg, #2563eb, #6366f1); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; color: #fff; flex-shrink: 0; overflow: hidden; }
+.hub-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.hub-avatar-wrap { position: relative; width: 38px; height: 38px; flex-shrink: 0; cursor: pointer; }
+.hub-avatar-wrap:hover .hub-avatar-overlay { opacity: 1; }
+.hub-avatar-overlay { position: absolute; inset: 0; border-radius: 10px; background: rgba(0,0,0,0.45); display: flex; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.18s; pointer-events: none; }
+.hub-avatar-input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
 .hub-user-info { display: flex; flex-direction: column; }
 .hub-user-name { font-size: 14px; font-weight: 600; color: var(--text); line-height: 1.3; }
 .hub-user-email { font-size: 12px; color: var(--text-muted); }
@@ -105,9 +110,12 @@ const hubCss = `
 }
 `;
 
+const USER_PHOTO_KEY = (email) => `cn_user_photo_${email}`;
+
 export default function App() {
   const [page, setPage] = useState("home");
   const [user, setUser] = useState(null);
+  const [userPhoto, setUserPhoto] = useState(null);
 
   const SESSION_TTL = 2 * 24 * 60 * 60 * 1000;
 
@@ -116,12 +124,26 @@ export default function App() {
       const s = JSON.parse(localStorage.getItem("cn_user"));
       if (s && s.loginTime && (Date.now() - s.loginTime) < SESSION_TTL) {
         setUser(s);
+        setUserPhoto(localStorage.getItem(USER_PHOTO_KEY(s.email)) || null);
         setPage(s.isAdmin ? "admin" : "hub");
       } else {
         localStorage.removeItem("cn_user");
       }
     } catch {}
   }, []);
+
+  function handlePhotoUpload(e) {
+    const file = e.target.files[0];
+    if (!file || !user?.email) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const dataUrl = ev.target.result;
+      localStorage.setItem(USER_PHOTO_KEY(user.email), dataUrl);
+      setUserPhoto(dataUrl);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  }
 
   // Heartbeat: update lastSeen every 30 s while user is in the hub
   useEffect(() => {
@@ -135,6 +157,7 @@ export default function App() {
     const sessionData = { ...userData, loginTime: Date.now() };
     localStorage.setItem("cn_user", JSON.stringify(sessionData));
     setUser(sessionData);
+    setUserPhoto(localStorage.getItem(USER_PHOTO_KEY(userData.email)) || null);
     if (!userData.isAdmin) recordLogin(userData.email);
     setPage(userData.isAdmin ? "admin" : "hub");
   }
@@ -172,7 +195,17 @@ export default function App() {
                 Cloud<span>Nexus</span>
               </div>
               <div className="hub-user-row">
-                <div className="hub-avatar"><AccountIcon /></div>
+                <label className="hub-avatar-wrap" title="Click to change profile photo">
+                  <div className="hub-avatar">
+                    {userPhoto
+                      ? <img src={userPhoto} alt="profile" />
+                      : <AccountIcon />}
+                  </div>
+                  <div className="hub-avatar-overlay">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                  </div>
+                  <input type="file" accept="image/*" className="hub-avatar-input" onChange={handlePhotoUpload} />
+                </label>
                 <div className="hub-user-info">
                   <span className="hub-user-name">{user.name}</span>
                   <span className="hub-user-email">{user.email}</span>
