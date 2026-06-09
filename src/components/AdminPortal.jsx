@@ -763,7 +763,21 @@ export default function AdminPortal({ admin, onLogout }) {
   }
 
   function deleteUser(id) {
-    if (window.confirm("Delete this user? They will lose access immediately.")) {
+    const target = users.find(u => u.id === id);
+    if (!target) return;
+    if (window.confirm(`Delete ${target.name}? Their session will be terminated immediately.`)) {
+      // Revoke on backend so monitoring/billing tools detect it
+      fetch("/api/revoke-session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: target.email }),
+      }).catch(() => {});
+      // Write to localStorage so the hub detects it instantly
+      try {
+        const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
+        revoked[target.email.toLowerCase()] = Date.now();
+        localStorage.setItem("cn_revoked_sessions", JSON.stringify(revoked));
+      } catch {}
       updateUsers(users.filter(u => u.id !== id));
     }
   }

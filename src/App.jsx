@@ -101,6 +101,13 @@ const hubCss = `
 .hub-no-access-icon { margin-bottom: 16px; }
 .hub-no-access h3 { font-size: 18px; font-weight: 700; color: #334155; margin-bottom: 8px; }
 .hub-no-access p { font-size: 14px; color: #64748b; }
+.hub-revoked-overlay { position:fixed; inset:0; background:rgba(7,17,31,0.92); backdrop-filter:blur(6px); z-index:9999; display:flex; align-items:center; justify-content:center; padding:24px; }
+.hub-revoked-card { background:#fff; border-radius:20px; padding:40px 36px; max-width:420px; width:100%; text-align:center; box-shadow:0 24px 64px rgba(0,0,0,0.3); }
+.hub-revoked-icon { width:60px; height:60px; background:#fee2e2; border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 20px; }
+.hub-revoked-title { font-size:20px; font-weight:800; color:#0f172a; margin-bottom:10px; letter-spacing:-0.4px; }
+.hub-revoked-sub { font-size:14px; color:#64748b; line-height:1.6; margin-bottom:28px; }
+.hub-revoked-btn { display:inline-block; background:#2563eb; color:#fff; font-size:14px; font-weight:700; padding:12px 32px; border-radius:10px; border:none; cursor:pointer; font-family:inherit; transition:background 0.2s; }
+.hub-revoked-btn:hover { background:#1d4ed8; }
 @media (max-width: 640px) {
   .hub-cards.two-col { grid-template-columns: 1fr; max-width: 420px; }
   .hub-header-inner { padding: 0 20px; }
@@ -116,6 +123,7 @@ export default function App() {
   const [page, setPage] = useState("home");
   const [user, setUser] = useState(null);
   const [userPhoto, setUserPhoto] = useState(null);
+  const [sessionRevoked, setSessionRevoked] = useState(false);
 
   const SESSION_TTL = 2 * 24 * 60 * 60 * 1000;
 
@@ -148,10 +156,30 @@ export default function App() {
   // Heartbeat: update lastSeen every 30 s while user is in the hub
   useEffect(() => {
     if (page !== "hub" || !user?.email) return;
-    updateLastSeen(user.email); // immediate update on page load / restore
+    updateLastSeen(user.email);
     const id = setInterval(() => updateLastSeen(user.email), 30000);
     return () => clearInterval(id);
   }, [page, user?.email]);
+
+  // Poll for session revocation every 3 s while user is in the hub
+  useEffect(() => {
+    if (page !== "hub" || !user?.email) return;
+    const email = user.email.toLowerCase();
+    function check() {
+      try {
+        const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
+        if (revoked[email]) setSessionRevoked(true);
+      } catch {}
+    }
+    check();
+    const id = setInterval(check, 3000);
+    // Also react instantly when another tab writes to localStorage
+    function onStorage(e) {
+      if (e.key === "cn_revoked_sessions") check();
+    }
+    window.addEventListener("storage", onStorage);
+    return () => { clearInterval(id); window.removeEventListener("storage", onStorage); };
+  }, [page, user?.email]); // eslint-disable-line
 
   function handleLogin(userData) {
     const sessionData = { ...userData, loginTime: Date.now() };
@@ -183,10 +211,42 @@ export default function App() {
     const hasBilling    = tools.includes("billing");
     const cardCount     = (hasMonitoring ? 1 : 0) + (hasBilling ? 1 : 0);
 
+    function handleRevokedRelogin() {
+      try {
+        const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
+        delete revoked[user.email.toLowerCase()];
+        localStorage.setItem("cn_revoked_sessions", JSON.stringify(revoked));
+      } catch {}
+      localStorage.removeItem("cn_user");
+      setSessionRevoked(false);
+      setUser(null);
+      setPage("auth");
+    }
+
     return (
       <>
         <style>{hubCss}</style>
-        <div className="hub-page">
+
+        {/* Session revoked overlay — blocks all interaction */}
+        {sessionRevoked && (
+          <div className="hub-revoked-overlay">
+            <div className="hub-revoked-card">
+              <div className="hub-revoked-icon">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              </div>
+              <div className="hub-revoked-title">Account Removed</div>
+              <div className="hub-revoked-sub">
+                Your account has been removed by the administrator.<br />
+                You no longer have access to CloudNexus.
+              </div>
+              <button className="hub-revoked-btn" onClick={handleRevokedRelogin}>
+                Back to Login
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="hub-page" style={sessionRevoked ? {pointerEvents:"none",userSelect:"none"} : {}}>
 
           <header className="hub-header">
             <div className="hub-header-inner">
@@ -230,14 +290,14 @@ export default function App() {
             ) : (
               <div className={`hub-cards ${cardCount === 2 ? "two-col" : "one-col"}`}>
                 {hasMonitoring && (
-                  <div className="hub-img-card" onClick={() => window.open("http://localhost:3007", "_blank")}>
+                  <div className="hub-img-card" onClick={() => window.open(`http://localhost:3007?uid=${encodeURIComponent(user.email)}`, "_blank")}>
                     <img src="/images/card-monitoring.png" alt="Monitoring" />
                     <div className="hub-img-fade" />
                     <button className="hub-img-cta">Go to Monitoring <ArrowRight /></button>
                   </div>
                 )}
                 {hasBilling && (
-                  <div className="hub-img-card" onClick={() => window.open("http://localhost:3008", "_blank")}>
+                  <div className="hub-img-card" onClick={() => window.open(`http://localhost:3008?uid=${encodeURIComponent(user.email)}`, "_blank")}>
                     <img src="/images/card-billing.png" alt="Billing" />
                     <div className="hub-img-fade" />
                     <button className="hub-img-cta">Go to Billing <ArrowRight /></button>
@@ -247,7 +307,7 @@ export default function App() {
             )}
           </main>
 
-        </div>
+        </div>{/* hub-page */}
       </>
     );
   }

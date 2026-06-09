@@ -4671,6 +4671,21 @@ app.post('/api/logs', (req, res) => {
 // Health check
 app.get('/health', (_, res) => res.json({ status: 'ok', providers: credentialStore.listProviders() }));
 
+// ── Session Revocation ────────────────────────────────────────────────────────
+const revokedSessions = new Set();
+
+app.post('/api/revoke-session', (req, res) => {
+  const { email } = req.body || {};
+  if (email) revokedSessions.add(email.toLowerCase().trim());
+  res.json({ ok: true });
+});
+
+app.get('/api/session-check', (req, res) => {
+  const email = (req.query.email || '').toLowerCase().trim();
+  if (!email) return res.json({ valid: false });
+  res.json({ valid: !revokedSessions.has(email) });
+});
+
 // â”€â”€ Auth / Connections â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.post('/api/connect/:provider', async (req, res) => {
   const { provider } = req.params;

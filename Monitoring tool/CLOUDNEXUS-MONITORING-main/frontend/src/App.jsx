@@ -57,6 +57,24 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState('all');
   const [backendOnline, setBackendOnline] = useState(false);
+  const [sessionRevoked, setSessionRevoked] = useState(false);
+
+  // Read user email from URL param (?uid=...) and poll session validity every 5 s
+  useEffect(() => {
+    const uid = new URLSearchParams(window.location.search).get('uid');
+    if (!uid) return;
+    let cancelled = false;
+    async function check() {
+      try {
+        const res = await fetch(`/api/session-check?email=${encodeURIComponent(uid)}`);
+        const data = await res.json();
+        if (!cancelled && !data.valid) setSessionRevoked(true);
+      } catch {}
+    }
+    check();
+    const id = setInterval(check, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   const [realData, setRealData] = useState({ aws: [], gcp: [], azure: [] });
   const [realAlerts, setRealAlerts] = useState([]);
@@ -209,6 +227,26 @@ export default function App() {
   ];
 
   const connectedCount = Object.values(connections).filter(c => c.connected).length;
+
+  if (sessionRevoked) return (
+    <div style={{position:'fixed',inset:0,background:'rgba(7,17,31,0.93)',backdropFilter:'blur(6px)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',padding:24}}>
+      <div style={{background:'#fff',borderRadius:20,padding:'40px 36px',maxWidth:420,width:'100%',textAlign:'center',boxShadow:'0 24px 64px rgba(0,0,0,0.3)'}}>
+        <div style={{width:60,height:60,background:'#fee2e2',borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 20px'}}>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        </div>
+        <div style={{fontSize:20,fontWeight:800,color:'#0f172a',marginBottom:10,letterSpacing:'-0.4px'}}>Account Removed</div>
+        <div style={{fontSize:14,color:'#64748b',lineHeight:1.6,marginBottom:28}}>
+          Your account has been removed by the administrator.<br/>You no longer have access to this tool.
+        </div>
+        <button
+          onClick={() => window.location.href = 'http://localhost:3006'}
+          style={{background:'#2563eb',color:'#fff',fontSize:14,fontWeight:700,padding:'12px 32px',borderRadius:10,border:'none',cursor:'pointer'}}
+        >
+          Back to Login
+        </button>
+      </div>
+    </div>
+  );
 
   return (
     <div className="app">
