@@ -250,11 +250,22 @@ export default function App() {
   const [sessionRevoked,   setSessionRevoked]   = useState(false);
 
   const alertSvc = useRef(new AlertService());
+  const uidRef = useRef('');
 
-  // Poll session validity every 5 s using ?uid= URL param
-  useEffect(() => {
-    const uid = new URLSearchParams(window.location.search).get('uid');
+  function logActivity(type, details) {
+    const uid = uidRef.current;
     if (!uid) return;
+    fetch('http://localhost:3001/api/activity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: uid, type, details: details || {} }) }).catch(() => {});
+  }
+
+  // Persist uid from URL and poll session validity — works even if tab was already open before deletion
+  useEffect(() => {
+    const urlUid = new URLSearchParams(window.location.search).get('uid');
+    if (urlUid) localStorage.setItem('cn_tool_uid', urlUid.toLowerCase().trim());
+    const uid = urlUid || localStorage.getItem('cn_tool_uid');
+    if (!uid) return;
+    uidRef.current = uid;
+    logActivity('session_start', { tool: 'Billing' });
     let cancelled = false;
     async function check() {
       try {
@@ -264,7 +275,7 @@ export default function App() {
       } catch {}
     }
     check();
-    const id = setInterval(check, 5000);
+    const id = setInterval(check, 3000);
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
@@ -315,6 +326,8 @@ export default function App() {
   function handleOpenConnect() { setModalOpen(true); }
 
   function handleAllConnected(conns) {
+    Object.keys(conns).forEach(p => { if (conns[p]?.connected && !connections[p]?.connected) logActivity('cloud_connected', { provider: p.toUpperCase() }); });
+    Object.keys(connections).forEach(p => { if (!conns[p]?.connected && connections[p]?.connected) logActivity('cloud_disconnected', { provider: p.toUpperCase() }); });
     setConnections(conns);
     const anyConnected = Object.values(conns).some(c => c.connected);
     if (anyConnected) setMode('real');
@@ -323,6 +336,13 @@ export default function App() {
   function handleModeChange(m) {
     if (m === 'mock') setMode('mock');
   }
+
+  // Log tab navigation
+  const firstTab = useRef(true);
+  useEffect(() => {
+    if (firstTab.current) { firstTab.current = false; return; }
+    logActivity('tab_viewed', { tab: tab.charAt(0).toUpperCase() + tab.slice(1) });
+  }, [tab]);
 
   const connectedProviders = Object.entries(connections)
     .filter(([, v]) => v.connected)

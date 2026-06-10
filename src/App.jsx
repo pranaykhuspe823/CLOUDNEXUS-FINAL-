@@ -161,21 +161,40 @@ export default function App() {
     return () => clearInterval(id);
   }, [page, user?.email]);
 
-  // Poll for session revocation every 3 s while user is in the hub
+  // Poll for session revocation every 3 s while user is in the hub or using a tool
   useEffect(() => {
-    if (page !== "hub" || !user?.email) return;
+    if (!["hub", "monitoring", "billing"].includes(page) || !user?.email) return;
     const email = user.email.toLowerCase();
-    function check() {
+
+    function checkLocal() {
+      // 1) Explicit revocation list
       try {
         const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
-        if (revoked[email]) setSessionRevoked(true);
+        if (revoked[email]) { setSessionRevoked(true); return; }
+      } catch {}
+      // 2) Account no longer in user list (admin deleted) — most direct check
+      try {
+        const list = JSON.parse(localStorage.getItem("cn_admin_users") || "[]");
+        if (list.length > 0 && !list.find(u => u.email && u.email.toLowerCase() === email)) {
+          setSessionRevoked(true);
+        }
       } catch {}
     }
+
+    async function checkBackend() {
+      try {
+        const res = await fetch(`http://localhost:3001/api/session-check?email=${encodeURIComponent(email)}`);
+        const data = await res.json();
+        if (!data.valid) setSessionRevoked(true);
+      } catch {}
+    }
+
+    function check() { checkLocal(); checkBackend(); }
     check();
     const id = setInterval(check, 3000);
-    // Also react instantly when another tab writes to localStorage
+    // React instantly when another tab changes either key
     function onStorage(e) {
-      if (e.key === "cn_revoked_sessions") check();
+      if (e.key === "cn_revoked_sessions" || e.key === "cn_admin_users") checkLocal();
     }
     window.addEventListener("storage", onStorage);
     return () => { clearInterval(id); window.removeEventListener("storage", onStorage); };
@@ -290,14 +309,14 @@ export default function App() {
             ) : (
               <div className={`hub-cards ${cardCount === 2 ? "two-col" : "one-col"}`}>
                 {hasMonitoring && (
-                  <div className="hub-img-card" onClick={() => window.open(`http://localhost:3007?uid=${encodeURIComponent(user.email)}`, "_blank")}>
+                  <div className="hub-img-card" onClick={() => setPage("monitoring")}>
                     <img src="/images/card-monitoring.png" alt="Monitoring" />
                     <div className="hub-img-fade" />
                     <button className="hub-img-cta">Go to Monitoring <ArrowRight /></button>
                   </div>
                 )}
                 {hasBilling && (
-                  <div className="hub-img-card" onClick={() => window.open(`http://localhost:3008?uid=${encodeURIComponent(user.email)}`, "_blank")}>
+                  <div className="hub-img-card" onClick={() => setPage("billing")}>
                     <img src="/images/card-billing.png" alt="Billing" />
                     <div className="hub-img-fade" />
                     <button className="hub-img-cta">Go to Billing <ArrowRight /></button>
@@ -309,6 +328,73 @@ export default function App() {
 
         </div>{/* hub-page */}
       </>
+    );
+  }
+
+  /* ── TOOL IFRAME PAGES ── */
+  if (page === "monitoring" || page === "billing") {
+    const toolUrl = page === "monitoring"
+      ? `http://localhost:3007?uid=${encodeURIComponent(user.email)}`
+      : `http://localhost:3008?uid=${encodeURIComponent(user.email)}`;
+    const toolLabel = page === "monitoring" ? "Monitoring" : "Billing";
+    return (
+      <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column" }}>
+        {sessionRevoked && (
+          <div className="hub-revoked-overlay">
+            <div className="hub-revoked-card">
+              <div className="hub-revoked-icon">
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+              </div>
+              <div className="hub-revoked-title">Account Removed</div>
+              <div className="hub-revoked-sub">Your account has been removed by the administrator.<br />You no longer have access to CloudNexus.</div>
+              <button className="hub-revoked-btn" onClick={handleRevokedRelogin}>Back to Login</button>
+            </div>
+          </div>
+        )}
+        <div style={{ height: 52, background: "#0f172a", display: "flex", alignItems: "center", padding: "0 20px", gap: 16, flexShrink: 0, borderBottom: "1px solid #1e293b" }}>
+          <button
+            onClick={() => setPage("hub")}
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "1px solid #334155", color: "#94a3b8", padding: "6px 14px", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 500, whiteSpace: "nowrap" }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            Back to Hub
+          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 28, height: 28, background: "#2563eb", borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+            </div>
+            <span style={{ color: "#fff", fontWeight: 700, fontSize: 15, letterSpacing: "-0.01em" }}>Cloud<span style={{ color: "#60a5fa" }}>Nexus</span></span>
+          </div>
+          <span style={{ color: "#334155", fontSize: 16 }}>|</span>
+          <span style={{ color: "#e2e8f0", fontSize: 13, fontWeight: 500 }}>{toolLabel}</span>
+
+          {/* User profile — pushed to the right */}
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 32, height: 32, borderRadius: "50%", overflow: "hidden", background: "#1e293b", border: "2px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              {userPhoto
+                ? <img src={userPhoto} alt="avatar" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+              }
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.2 }}>
+              <span style={{ color: "#f1f5f9", fontSize: 13, fontWeight: 600 }}>{user.name}</span>
+              <span style={{ color: "#64748b", fontSize: 11 }}>{user.email}</span>
+            </div>
+            <button
+              onClick={logout}
+              style={{ marginLeft: 4, background: "none", border: "1px solid #334155", color: "#94a3b8", padding: "5px 12px", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 500 }}
+            >
+              Sign out
+            </button>
+          </div>
+        </div>
+        <iframe
+          src={toolUrl}
+          style={{ flex: 1, border: "none", width: "100%" }}
+          title={toolLabel}
+          allow="clipboard-read; clipboard-write"
+        />
+      </div>
     );
   }
 

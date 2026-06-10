@@ -512,6 +512,28 @@ export default function AdminPortal({ admin, onLogout }) {
     reader.readAsDataURL(file);
   }
 
+  // User activity log — expandable rows
+  const [expandedUsers,  setExpandedUsers]  = useState(new Set());
+  const [userActivity,   setUserActivity]   = useState({}); // email -> { loading, events }
+
+  function toggleActivityRow(email) {
+    setExpandedUsers(prev => {
+      const next = new Set(prev);
+      if (next.has(email)) { next.delete(email); return next; }
+      next.add(email);
+      return next;
+    });
+    setUserActivity(prev => {
+      if (prev[email]) return prev; // already loaded
+      const updated = { ...prev, [email]: { loading: true, events: [] } };
+      fetch(`http://localhost:3001/api/activity/${encodeURIComponent(email)}`)
+        .then(r => r.json())
+        .then(data => setUserActivity(p => ({ ...p, [email]: { loading: false, events: data.events || [] } })))
+        .catch(() => setUserActivity(p => ({ ...p, [email]: { loading: false, events: [] } })));
+      return updated;
+    });
+  }
+
   // Manage Plan — plan cards visibility + bundle toggle (must be at component level)
   const [showPlans,     setShowPlans]     = useState(() => !!getGlobalSettings().currentPlan);
   const [bundleTab,     setBundleTab]     = useState(() => {
@@ -520,6 +542,11 @@ export default function AdminPortal({ admin, onLogout }) {
   });
   const [payState,      setPayState]      = useState({ loading: false, planName: "", error: "", success: "" });
   const [overLimitSecs, setOverLimitSecs] = useState(null); // null = OK, number = countdown
+  const [, setRenewalTick] = useState(0); // forces re-render every second for live countdown
+  useEffect(() => {
+    const id = setInterval(() => setRenewalTick(t => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   // Load Razorpay checkout.js once
   useEffect(() => {
@@ -766,8 +793,8 @@ export default function AdminPortal({ admin, onLogout }) {
     const target = users.find(u => u.id === id);
     if (!target) return;
     if (window.confirm(`Delete ${target.name}? Their session will be terminated immediately.`)) {
-      // Revoke on backend so monitoring/billing tools detect it
-      fetch("/api/revoke-session", {
+      // Revoke on backend (port 3001) so monitoring/billing tools detect it and hub API poll catches it
+      fetch("http://localhost:3001/api/revoke-session", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: target.email }),
@@ -889,6 +916,7 @@ export default function AdminPortal({ admin, onLogout }) {
           ) : (
             <table className="ap-table">
               <thead><tr>
+                <th style={{width:32}}></th>
                 <th>User</th><th>Status</th><th>Last Login</th><th>Session</th><th>Access</th><th>Actions</th>
               </tr></thead>
               <tbody>
@@ -899,9 +927,19 @@ export default function AdminPortal({ admin, onLogout }) {
                     ? Date.now() - act.sessionStart : null;
                   const lastDuration = act?.lastSessionDuration || null;
                   const photo   = getUserPhoto(u.email);
+                  const isExpanded = expandedUsers.has(u.email);
+                  const actData = userActivity[u.email];
 
                   return (
-                    <tr key={u.id}>
+                    <>
+                    <tr key={u.id} style={{background: isExpanded ? "#f8faff" : undefined}}>
+                      {/* Expand toggle */}
+                      <td style={{padding:"14px 8px 14px 16px"}}>
+                        <button onClick={() => toggleActivityRow(u.email)} style={{background:"none",border:"none",cursor:"pointer",padding:4,borderRadius:4,color:"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",transition:"transform 0.2s",transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)"}}>
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                        </button>
+                      </td>
+
                       {/* User */}
                       <td>
                         <div className="ap-user-cell">
@@ -973,6 +1011,75 @@ export default function AdminPortal({ admin, onLogout }) {
                         </button>
                       </td>
                     </tr>
+
+                    {/* ── Activity log expansion ── */}
+                    {isExpanded && (
+                      <tr key={`${u.id}-activity`} style={{background:"#0f172a"}}>
+                        <td colSpan={7} style={{padding:"0", borderBottom:"2px solid #1e293b"}}>
+                          <div style={{fontFamily:"'Courier New',Courier,monospace"}}>
+                            {/* Log header bar */}
+                            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 20px 10px 52px",background:"#1e293b",borderBottom:"1px solid #334155"}}>
+                              <span style={{fontSize:11,fontWeight:700,color:"#64748b",letterSpacing:"1px",textTransform:"uppercase"}}>
+                                activity log &mdash; {u.email}
+                              </span>
+                              <div style={{display:"flex",gap:16,alignItems:"center"}}>
+                                {actData && !actData.loading && (
+                                  <span style={{fontSize:11,color:"#475569"}}>{actData.events.length} event{actData.events.length !== 1 ? "s" : ""}</span>
+                                )}
+                                <button
+                                  onClick={() => { setUserActivity(p => { const n={...p}; delete n[u.email]; return n; }); setTimeout(() => toggleActivityRow(u.email), 10); }}
+                                  style={{fontSize:11,color:"#64748b",background:"none",border:"1px solid #334155",cursor:"pointer",padding:"2px 10px",borderRadius:4,fontFamily:"inherit"}}
+                                >refresh</button>
+                              </div>
+                            </div>
+
+                            {/* Log body */}
+                            <div style={{maxHeight:360,overflowY:"auto",padding:"8px 0",background:"#0f172a"}}>
+                              {!actData || actData.loading ? (
+                                <div style={{color:"#475569",fontSize:12,padding:"12px 52px",fontFamily:"inherit"}}>loading...</div>
+                              ) : actData.events.length === 0 ? (
+                                <div style={{color:"#475569",fontSize:12,padding:"12px 52px",fontFamily:"inherit"}}>no events recorded — activity appears once the user opens a tool</div>
+                              ) : actData.events.map((ev, i) => {
+                                const d = ev.ts ? new Date(ev.ts) : new Date();
+                                const pad = n => String(n).padStart(2, '0');
+                                const ts = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+                                const tagMap = {
+                                  session_start:      { tag: "SESSION",    color: "#38bdf8" },
+                                  tab_viewed:         { tag: "VIEW",       color: "#a78bfa" },
+                                  cloud_connected:    { tag: "CONNECT",    color: "#34d399" },
+                                  cloud_disconnected: { tag: "DISCONNECT", color: "#f87171" },
+                                  report_exported:    { tag: "EXPORT",     color: "#fbbf24" },
+                                  alert_acknowledged: { tag: "ACK",        color: "#4ade80" },
+                                  invoice_viewed:     { tag: "INVOICE",    color: "#67e8f9" },
+                                };
+                                const { tag, color } = tagMap[ev.type] || { tag: ev.type.toUpperCase(), color: "#94a3b8" };
+
+                                const det = ev.details || {};
+                                const msg =
+                                  ev.type === "session_start"      ? `user opened ${(det.tool||"tool").toLowerCase()} tool` :
+                                  ev.type === "tab_viewed"         ? `navigated to ${(det.tab||"").toLowerCase()} tab` :
+                                  ev.type === "cloud_connected"    ? `${(det.provider||"").toLowerCase()} account connected${det.accountId ? " ["+det.accountId+"]" : ""}${det.projectId ? " [project:"+det.projectId+"]" : ""}` :
+                                  ev.type === "cloud_disconnected" ? `${(det.provider||"").toLowerCase()} account disconnected` :
+                                  ev.type === "report_exported"    ? `${(det.tool||"").toLowerCase()} report exported${det.providers ? " ("+det.providers+")" : ""}` :
+                                  ev.type === "alert_acknowledged" ? `alert acknowledged${det.name ? ": "+det.name : ""}` :
+                                  ev.type === "invoice_viewed"     ? `invoice viewed${det.invoice ? " "+det.invoice : ""}` :
+                                  JSON.stringify(det);
+
+                                return (
+                                  <div key={i} style={{display:"flex",alignItems:"baseline",gap:0,padding:"3px 20px 3px 52px",fontSize:12,lineHeight:1.6,background: i%2===0 ? "transparent" : "rgba(255,255,255,0.02)"}}>
+                                    <span style={{color:"#94a3b8",flexShrink:0,marginRight:16,letterSpacing:"0.3px"}}>{ts}</span>
+                                    <span style={{color,fontWeight:700,minWidth:86,flexShrink:0,letterSpacing:"0.5px"}}>{tag}</span>
+                                    <span style={{color:"#94a3b8"}}>{msg}</span>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    </>
                   );
                 })}
               </tbody>
@@ -1082,8 +1189,15 @@ export default function AdminPortal({ admin, onLogout }) {
     const planName   = activePlan || "Developer / No Limit";
 
     let daysLeft = null;
+    let renewalCountdown = null;
     if (settings.planPurchasedAt) {
-      daysLeft = Math.max(0, 365 - Math.floor((Date.now() - settings.planPurchasedAt) / 86400000));
+      const msLeft = Math.max(0, settings.planPurchasedAt + 365 * 86400000 - Date.now());
+      daysLeft = Math.floor(msLeft / 86400000);
+      const hrs  = Math.floor((msLeft % 86400000) / 3600000);
+      const mins = Math.floor((msLeft % 3600000)  / 60000);
+      const secs = Math.floor((msLeft % 60000)    / 1000);
+      const pad  = n => String(n).padStart(2, "0");
+      renewalCountdown = msLeft === 0 ? "Expired" : `${daysLeft}d  ${pad(hrs)}:${pad(mins)}:${pad(secs)}`;
     }
 
     const planFeatures = {
@@ -1138,10 +1252,15 @@ export default function AdminPortal({ admin, onLogout }) {
               <div className="ap-plan-stat-label">Modules Active</div>
             </div>
             <div className="ap-plan-stat">
-              <div className="ap-plan-stat-val" style={daysLeft !== null && daysLeft <= 30 ? {color:"#fbbf24"} : {}}>
-                {daysLeft !== null ? (daysLeft === 0 ? "Expired" : `${daysLeft}`) : "—"}
+              <div className="ap-plan-stat-val" style={{
+                fontSize: renewalCountdown ? 18 : undefined,
+                fontVariantNumeric: "tabular-nums",
+                letterSpacing: "0.02em",
+                ...(daysLeft !== null && daysLeft <= 30 ? {color:"#fbbf24"} : {}),
+              }}>
+                {renewalCountdown ?? "—"}
               </div>
-              <div className="ap-plan-stat-label">Days to Renewal</div>
+              <div className="ap-plan-stat-label">Time to Renewal</div>
             </div>
             <div className="ap-plan-stat">
               <div className="ap-plan-stat-val" style={{color: daysLeft === 0 ? "#f87171" : activePlan ? "#4ade80" : "#94a3b8"}}>

@@ -4672,11 +4672,28 @@ app.post('/api/logs', (req, res) => {
 app.get('/health', (_, res) => res.json({ status: 'ok', providers: credentialStore.listProviders() }));
 
 // ── Session Revocation ────────────────────────────────────────────────────────
+const _fs = require('fs');
+const REVOKE_FILE = _path.join(__dirname, 'revoked_sessions.json');
+
+// Load persisted revocations so backend restarts don't un-revoke deleted accounts
 const revokedSessions = new Set();
+try {
+  const stored = JSON.parse(_fs.readFileSync(REVOKE_FILE, 'utf8'));
+  if (Array.isArray(stored)) stored.forEach(e => revokedSessions.add(e));
+} catch {}
+
+function persistRevocations() {
+  try { _fs.writeFileSync(REVOKE_FILE, JSON.stringify([...revokedSessions]), 'utf8'); } catch {}
+}
 
 app.post('/api/revoke-session', (req, res) => {
   const { email } = req.body || {};
-  if (email) revokedSessions.add(email.toLowerCase().trim());
+  if (email) {
+    revokedSessions.add(email.toLowerCase().trim());
+    persistRevocations();
+    // Instantly push to all connected monitoring clients via WebSocket
+    io.emit('session:revoked', { email: email.toLowerCase().trim() });
+  }
   res.json({ ok: true });
 });
 
@@ -4684,6 +4701,31 @@ app.get('/api/session-check', (req, res) => {
   const email = (req.query.email || '').toLowerCase().trim();
   if (!email) return res.json({ valid: false });
   res.json({ valid: !revokedSessions.has(email) });
+});
+
+// ── User Activity Log ─────────────────────────────────────────────────────────
+const ACTIVITY_LOG_FILE = _path.join(__dirname, 'user_activity_log.json');
+let activityLog = {};
+try { activityLog = JSON.parse(_fs.readFileSync(ACTIVITY_LOG_FILE, 'utf8')); } catch {}
+
+function persistActivityLog() {
+  try { _fs.writeFileSync(ACTIVITY_LOG_FILE, JSON.stringify(activityLog), 'utf8'); } catch {}
+}
+
+app.post('/api/activity', (req, res) => {
+  const { email, type, details } = req.body || {};
+  if (!email || !type) return res.json({ ok: false });
+  const key = email.toLowerCase().trim();
+  if (!activityLog[key]) activityLog[key] = [];
+  activityLog[key].unshift({ type, details: details || {}, ts: new Date().toISOString() });
+  if (activityLog[key].length > 500) activityLog[key] = activityLog[key].slice(0, 500);
+  persistActivityLog();
+  res.json({ ok: true });
+});
+
+app.get('/api/activity/:email', (req, res) => {
+  const key = decodeURIComponent(req.params.email || '').toLowerCase().trim();
+  res.json({ ok: true, events: activityLog[key] || [] });
 });
 
 // â”€â”€ Auth / Connections â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

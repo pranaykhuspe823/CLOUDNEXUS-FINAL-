@@ -218,8 +218,7 @@ export default function Landing({ onNavigate }) {
             <a href="#contact">Contact Us</a>
           </div>
           <div className="nav-actions">
-            <button className="btn btn-ghost btn-sm" onClick={() => onNavigate("auth")}>Sign in</button>
-            <button className="btn btn-primary btn-sm" onClick={() => onNavigate("auth")}>Get Started <ArrowRight /></button>
+            <button className="btn btn-primary btn-sm" onClick={() => onNavigate("auth")}>Login</button>
           </div>
         </div>
       </nav>
@@ -237,7 +236,6 @@ export default function Landing({ onNavigate }) {
               CloudNexus gives engineering teams complete visibility into cloud infrastructure usage, costs, and performance — all from one unified dashboard.
             </p>
             <div className="hero-actions">
-              <button className="btn btn-primary btn-xl" onClick={() => onNavigate("auth")}>Start Free Trial</button>
               <button className="btn btn-secondary btn-xl" onClick={() => scrollToContact()}>Book a Demo</button>
             </div>
           </div>
@@ -455,8 +453,8 @@ export default function Landing({ onNavigate }) {
                     : ["1 Admin + 1 User", "Billing Module Access", "Cost Analytics & Forecasting", "Invoice & Budget Management", "Email Support"]
                   ).map(f => <li key={f}><CheckIcon />{f}</li>)}
                 </ul>
-                <button className="btn btn-secondary btn-lg pc-btn" onClick={() => onNavigate("auth")}>
-                  Get Started <ArrowRight />
+                <button className="btn btn-secondary btn-lg pc-btn" onClick={() => scrollToContact()}>
+                  Contact Us <ArrowRight />
                 </button>
               </div>
             </div>
@@ -473,8 +471,8 @@ export default function Landing({ onNavigate }) {
                   <li key={f}><CheckIcon />{f}</li>
                 ))}
               </ul>
-              <button className="btn btn-secondary btn-lg pc-btn" onClick={() => scrollToContact("Standard Pro")}>
-                Contact Sales <ArrowRight />
+              <button className="btn btn-secondary btn-lg pc-btn" onClick={() => scrollToContact()}>
+                Contact Us <ArrowRight />
               </button>
             </div>
 
@@ -491,8 +489,8 @@ export default function Landing({ onNavigate }) {
                   <li key={f}><CheckIcon />{f}</li>
                 ))}
               </ul>
-              <button className="btn btn-primary btn-lg pc-btn" onClick={() => scrollToContact("Professional")}>
-                Contact Sales <ArrowRight />
+              <button className="btn btn-secondary btn-lg pc-btn" onClick={() => scrollToContact()}>
+                Contact Us <ArrowRight />
               </button>
             </div>
 
@@ -508,8 +506,8 @@ export default function Landing({ onNavigate }) {
                   <li key={f}><CheckIcon />{f}</li>
                 ))}
               </ul>
-              <button className="btn btn-secondary btn-lg pc-btn" onClick={() => scrollToContact("Enterprise")}>
-                Contact Sales <ArrowRight />
+              <button className="btn btn-secondary btn-lg pc-btn" onClick={() => scrollToContact()}>
+                Contact Us <ArrowRight />
               </button>
             </div>
 
@@ -636,26 +634,6 @@ export default function Landing({ onNavigate }) {
         </div>
       </section>
 
-      {/* Footer */}
-      <footer className="footer">
-        <div className="footer-container">
-          <div className="footer-top">
-            <div className="logo" style={{ fontSize: 18 }}>
-              <div className="logo-icon" style={{ width: 28, height: 28 }}><CloudIcon /></div>
-              Cloud<span>Nexus</span>
-            </div>
-            <div className="footer-links">
-              <a href="#features">Features</a><a href="#solutions">Solutions</a><a href="#">Careers</a><a href="#">Contact</a>
-            </div>
-          </div>
-          <div className="footer-bottom">
-            <span className="footer-copy">© 2026 CloudNexus. All rights reserved.</span>
-            <div className="footer-links">
-              <a href="#">Privacy</a><a href="#">Terms</a>
-            </div>
-          </div>
-        </div>
-      </footer>
 
       {/* Carousel Overlay */}
       {activeCarousel === "monitoring" && (

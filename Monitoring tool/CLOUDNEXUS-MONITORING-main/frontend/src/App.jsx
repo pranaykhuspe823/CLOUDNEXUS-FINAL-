@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { PROVIDER_META, fmt } from './utils/theme';
 import {
   MOCK_AWS_SERVICES, MOCK_GCP_SERVICES, MOCK_AZURE_SERVICES,
@@ -58,11 +58,22 @@ export default function App() {
   const [filterStatus, setFilterStatus] = useState('all');
   const [backendOnline, setBackendOnline] = useState(false);
   const [sessionRevoked, setSessionRevoked] = useState(false);
+  const uidRef = useRef('');
 
-  // Read user email from URL param (?uid=...) and poll session validity every 5 s
-  useEffect(() => {
-    const uid = new URLSearchParams(window.location.search).get('uid');
+  function logActivity(type, details) {
+    const uid = uidRef.current;
     if (!uid) return;
+    fetch('/api/activity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: uid, type, details: details || {} }) }).catch(() => {});
+  }
+
+  // Persist uid from URL and poll session validity — works even if tab was already open before deletion
+  useEffect(() => {
+    const urlUid = new URLSearchParams(window.location.search).get('uid');
+    if (urlUid) localStorage.setItem('cn_tool_uid', urlUid.toLowerCase().trim());
+    const uid = urlUid || localStorage.getItem('cn_tool_uid');
+    if (!uid) return;
+    uidRef.current = uid;
+    logActivity('session_start', { tool: 'Monitoring' });
     let cancelled = false;
     async function check() {
       try {
@@ -72,7 +83,7 @@ export default function App() {
       } catch {}
     }
     check();
-    const id = setInterval(check, 5000);
+    const id = setInterval(check, 3000);
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
@@ -119,11 +130,38 @@ export default function App() {
     },
     onAlertsUpdated: (alerts) => setRealAlerts(alerts),
     onTopologyUpdated: (topology) => setRealTopology(topology),
+    onSessionRevoked: ({ email }) => {
+      const uid = localStorage.getItem('cn_tool_uid') || new URLSearchParams(window.location.search).get('uid');
+      if (uid && email && uid.toLowerCase() === email.toLowerCase()) setSessionRevoked(true);
+    },
   });
 
   useEffect(() => {
     fetch('/health').then(r => r.json()).then(() => setBackendOnline(true)).catch(() => setBackendOnline(false));
   }, []);
+
+  // Log tab navigation
+  const firstTab = useRef(true);
+  useEffect(() => {
+    if (firstTab.current) { firstTab.current = false; return; }
+    logActivity('tab_viewed', { tab: tab.charAt(0).toUpperCase() + tab.slice(1) });
+  }, [tab]);
+
+  // Log cloud connections / disconnections
+  const prevConns = useRef({});
+  useEffect(() => {
+    const prev = prevConns.current;
+    Object.keys(connections).forEach(p => { if (!prev[p]) logActivity('cloud_connected', { provider: p.toUpperCase() }); });
+    Object.keys(prev).forEach(p => { if (!connections[p]) logActivity('cloud_disconnected', { provider: p.toUpperCase() }); });
+    prevConns.current = { ...connections };
+  }, [connections]);
+
+  // Log report export
+  const prevExport = useRef(false);
+  useEffect(() => {
+    if (exportOpen && !prevExport.current) logActivity('report_exported', { tool: 'Monitoring' });
+    prevExport.current = exportOpen;
+  }, [exportOpen]);
 
   const isReal = mode === 'real' && backendOnline;
 

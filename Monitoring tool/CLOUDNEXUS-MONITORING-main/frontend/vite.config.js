@@ -6,6 +6,10 @@ export default defineConfig({
   server: {
     port: 3007,
     strictPort: true,
+    headers: {
+      'X-Frame-Options': 'ALLOWALL',
+      'Content-Security-Policy': "frame-ancestors *",
+    },
     proxy: {
       '/api':       { target: 'http://localhost:3001', changeOrigin: true },
       '/health':    { target: 'http://localhost:3001', changeOrigin: true },

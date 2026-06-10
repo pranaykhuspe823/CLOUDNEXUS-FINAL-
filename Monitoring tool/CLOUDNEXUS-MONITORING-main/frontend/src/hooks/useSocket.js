@@ -25,6 +25,7 @@ export function useSocket(handlers) {
     socket.on('provider:disconnected', data => handlersRef.current.onProviderDisconnected?.(data));
     socket.on('alerts:updated', data => handlersRef.current.onAlertsUpdated?.(data));
     socket.on('topology:updated', data => handlersRef.current.onTopologyUpdated?.(data));
+    socket.on('session:revoked', data => handlersRef.current.onSessionRevoked?.(data));
 
     return () => socket.disconnect();
   }, []);
