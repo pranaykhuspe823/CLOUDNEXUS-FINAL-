@@ -6,7 +6,7 @@ import sqlite3, json, os, hashlib, hmac
 from pathlib import Path
 from datetime import datetime, timedelta
 
-DB_PATH  = Path(r"d:\CloudNexus_Website\cloudnexus.db")
+DB_PATH  = Path(os.environ.get('DB_PATH', Path(__file__).parent / 'cloudnexus.db'))
 _SESSION_KEY = hashlib.sha256(b"cloudnexus-session-key-2024").digest()
 
 

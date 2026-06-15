@@ -4542,6 +4542,9 @@ const rateLimit = require('express-rate-limit');
 const winston = require('winston');
 const db = require('./cloudnexus_db.cjs');
 
+// Portable DB path — matches cloudnexus_db.cjs
+const _DB_PATH = process.env.DB_PATH || require('path').join(__dirname, 'cloudnexus.db');
+
 
 // â”€â”€â”€ Logger â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const logger = winston.createLogger({
@@ -4557,10 +4560,11 @@ const logger = winston.createLogger({
 const app = express();
 const server = http.createServer(app);
 const ALLOWED_ORIGINS = process.env.FRONTEND_URL
-  ? [process.env.FRONTEND_URL]
+  ? process.env.FRONTEND_URL.split(',').map(u => u.trim())
   : ['http://localhost:3006', 'http://localhost:3007', 'http://localhost:3008',
      'http://localhost:5173', 'http://localhost:5174', 'http://localhost:5175',
-     'http://localhost:3009', 'http://localhost:4173'];
+     'http://localhost:3009', 'http://localhost:4173',
+     'https://pranaykhuspe823.github.io'];
 
 const io = new SocketServer(server, {
   cors: { origin: ALLOWED_ORIGINS, credentials: true },
@@ -4850,7 +4854,7 @@ app.post('/auth/promote-user', (req, res) => {
   }
   dbObj.run(`UPDATE users SET role='admin' WHERE LOWER(email)=LOWER(?) AND LOWER(org_admin)=LOWER(?)`, [email, orgAdmin]);
   const _fsSync = require('fs');
-  _fsSync.writeFileSync(require('path').join('d:\\','CloudNexus_Website','cloudnexus.db'), Buffer.from(dbObj.export()));
+  _fsSync.writeFileSync(_DB_PATH, Buffer.from(dbObj.export()));
   db.addLog(email, 'promoted_to_co_admin', 'website', null, { promotedBy: orgAdmin }, orgAdmin);
   io.emit('admin:updated', { email: orgAdmin.toLowerCase(), action: 'sub_admin_added' });
   res.json({ success: true });
@@ -4863,7 +4867,7 @@ app.post('/auth/demote-user', (req, res) => {
   const dbObj = db.getDB();
   dbObj.run(`UPDATE users SET role='user' WHERE LOWER(email)=LOWER(?) AND LOWER(org_admin)=LOWER(?)`, [email, orgAdmin]);
   const _fsSync = require('fs');
-  _fsSync.writeFileSync(require('path').join('d:\\','CloudNexus_Website','cloudnexus.db'), Buffer.from(dbObj.export()));
+  _fsSync.writeFileSync(_DB_PATH, Buffer.from(dbObj.export()));
   db.addLog(email, 'demoted_from_co_admin', 'website', null, { demotedBy: orgAdmin }, orgAdmin);
   io.emit('admin:updated', { email: orgAdmin.toLowerCase(), action: 'sub_admin_removed' });
   res.json({ success: true });
@@ -5011,7 +5015,7 @@ app.post('/superadmin/create-admin', async (req, res) => {
   // Force-persist now (don't wait for debounce)
   const _fs  = require('fs');
   const _p   = require('path');
-  _fs.writeFileSync(_p.join('d:\\', 'CloudNexus_Website', 'cloudnexus.db'), Buffer.from(dbObj.export()));
+  _fs.writeFileSync(_DB_PATH, Buffer.from(dbObj.export()));
 
   db.addLog(email, 'admin_account_created', 'website', null, { createdBy: SA_EMAIL }, null);
   io.emit('admin:created', { email: email.toLowerCase(), name });
@@ -5023,7 +5027,7 @@ app.delete('/superadmin/admins/:email/plan', (req, res) => {
   const email = decodeURIComponent(req.params.email);
   db.cancelAdminPlan(email);
   const _fs = require('fs'); const _p = require('path');
-  _fs.writeFileSync(_p.join('d:\\','CloudNexus_Website','cloudnexus.db'), Buffer.from(db.getDB().export()));
+  _fs.writeFileSync(_DB_PATH, Buffer.from(db.getDB().export()));
   db.addLog(email, 'plan_cancelled_by_superadmin', 'website', null, null, null);
   io.emit('plan:cancelled', { email: email.toLowerCase() });
   io.emit('admin:updated',  { email: email.toLowerCase(), action: 'plan_cancelled' });
@@ -5035,7 +5039,7 @@ app.post('/superadmin/admins/:email/plan/pause', (req, res) => {
   const email = decodeURIComponent(req.params.email);
   db.pauseAdminPlan(email);
   const _fs = require('fs'); const _p = require('path');
-  _fs.writeFileSync(_p.join('d:\\','CloudNexus_Website','cloudnexus.db'), Buffer.from(db.getDB().export()));
+  _fs.writeFileSync(_DB_PATH, Buffer.from(db.getDB().export()));
   io.emit('plan:updated', { email: email.toLowerCase(), action: 'paused' });
   io.emit('admin:updated', { email: email.toLowerCase(), action: 'plan_paused' });
   res.json({ success: true });
@@ -5046,7 +5050,7 @@ app.post('/superadmin/admins/:email/plan/resume', (req, res) => {
   const email = decodeURIComponent(req.params.email);
   db.resumeAdminPlan(email);
   const _fs = require('fs'); const _p = require('path');
-  _fs.writeFileSync(_p.join('d:\\','CloudNexus_Website','cloudnexus.db'), Buffer.from(db.getDB().export()));
+  _fs.writeFileSync(_DB_PATH, Buffer.from(db.getDB().export()));
   io.emit('plan:updated', { email: email.toLowerCase(), action: 'resumed' });
   io.emit('admin:updated', { email: email.toLowerCase(), action: 'plan_resumed' });
   res.json({ success: true });
@@ -5075,7 +5079,7 @@ app.delete('/superadmin/admins/:email', (req, res) => {
   // Force-persist
   const _fs = require('fs');
   const _p  = require('path');
-  _fs.writeFileSync(_p.join('d:\\', 'CloudNexus_Website', 'cloudnexus.db'), Buffer.from(dbObj.export()));
+  _fs.writeFileSync(_DB_PATH, Buffer.from(dbObj.export()));
 
   res.json({ success: true });
 });
@@ -5754,6 +5758,17 @@ db.initDB().then(() => {
       fetchProvider(s.provider, oa).catch(e => logger.error(`Session restore fetch: ${e.message}`));
     }
   }
+  // Serve built frontends in production (Railway)
+  const _staticPath = require('path').join(__dirname, 'public');
+  if (require('fs').existsSync(_staticPath)) {
+    app.use('/monitor', require('express').static(require('path').join(_staticPath, 'monitor')));
+    app.use('/billing', require('express').static(require('path').join(_staticPath, 'billing')));
+    app.use(require('express').static(_staticPath));
+    app.get(/^\/(?!api|auth|health|superadmin|socket\.io).*/, (req, res) => {
+      res.sendFile(require('path').join(_staticPath, 'index.html'));
+    });
+  }
+
   server.listen(PORT, () => {
     logger.info(`CloudNexus backend running on http://localhost:${PORT}`);
   });

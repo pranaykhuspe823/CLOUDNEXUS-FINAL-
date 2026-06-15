@@ -16,7 +16,7 @@ from typing import Optional, Dict, Any
 import threading
 
 # ── Shared SQLite DB ──────────────────────────────────────────────────────
-sys.path.insert(0, r"d:\CloudNexus_Website")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
 try:
     from cloudnexus_db import init_db, save_cloud_session, load_cloud_sessions, \
         load_all_cloud_sessions, delete_cloud_session, add_log, get_org_admin_for_user

@@ -5,7 +5,7 @@ const crypto    = require('crypto');
 const bcrypt    = require('bcryptjs');
 const initSqlJs = require('sql.js');
 
-const DB_PATH = path.join('d:\\', 'CloudNexus_Website', 'cloudnexus.db');
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'cloudnexus.db');
 
 let _db        = null;
 let _saveTimer = null;
