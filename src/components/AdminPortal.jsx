@@ -1690,7 +1690,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   function renderToolSection(toolKey) {
     const isMonitoring = toolKey === "monitoring";
     const toolName    = isMonitoring ? "Monitoring" : "Billing";
-    const toolImg     = isMonitoring ? "/images/card-monitoring.png" : "/images/card-billing.png";
+    const toolImg     = isMonitoring ? `${import.meta.env.BASE_URL}images/card-monitoring.png` : `${import.meta.env.BASE_URL}images/card-billing.png`;
     const toolDesc    = isMonitoring
       ? "Real-time infrastructure monitoring, live alerts, server health dashboards, and network analytics."
       : "Cloud cost analytics, invoice management, budget forecasting, and spend optimisation.";

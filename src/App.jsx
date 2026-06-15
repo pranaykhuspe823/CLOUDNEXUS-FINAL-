@@ -548,14 +548,14 @@ export default function App() {
               <div className={`hub-cards ${cardCount === 2 ? "two-col" : "one-col"}`}>
                 {hasMonitoring && (
                   <div className="hub-img-card" onClick={() => setPage("monitoring")}>
-                    <img src="/images/card-monitoring.png" alt="Monitoring" />
+                    <img src={`${import.meta.env.BASE_URL}images/card-monitoring.png`} alt="Monitoring" />
                     <div className="hub-img-fade" />
                     <button className="hub-img-cta">Go to Monitoring <ArrowRight /></button>
                   </div>
                 )}
                 {hasBilling && (
                   <div className="hub-img-card" onClick={() => setPage("billing")}>
-                    <img src="/images/card-billing.png" alt="Billing" />
+                    <img src={`${import.meta.env.BASE_URL}images/card-billing.png`} alt="Billing" />
                     <div className="hub-img-fade" />
                     <button className="hub-img-cta">Go to Billing <ArrowRight /></button>
                   </div>

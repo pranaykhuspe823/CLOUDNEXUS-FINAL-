@@ -194,7 +194,7 @@ export default function AuthPage({ onLogin, onBack }) {
       <div className="auth-left">
         <div className="auth-left-content">
           <img
-            src="/images/login-photo.png"
+            src={`${import.meta.env.BASE_URL}images/login-photo.png`}
             alt="CloudNexus Platform"
             style={{ width: "100%", height: "100%", objectFit: "cover", objectPosition: "center" }}
           />

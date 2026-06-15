@@ -21,18 +21,19 @@ const CheckIcon = () => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
 );
 
+const _base = import.meta.env.BASE_URL;
 const monitoringCards = [
-  { image: "/images/monitoring_health.png", title: "Server Health Dashboard", desc: "Real-time CPU, memory, and disk monitoring across all your servers with automated health checks and instant anomaly detection." },
-  { image: "/images/monitoring_network.png", title: "Network Traffic Analytics", desc: "Visualize bandwidth consumption, request rates, and latency metrics with geographic traffic mapping across all regions." },
-  { image: "/images/monitoring_performance.png", title: "Application Performance", desc: "Track response times, throughput, and error rates with service dependency mapping and bottleneck identification." },
-  { image: "/images/monitoring_alerts.png", title: "Alert Management", desc: "Configure intelligent alerting with severity levels, escalation policies, and incident timelines for rapid response." },
+  { image: `${_base}images/monitoring_health.png`, title: "Server Health Dashboard", desc: "Real-time CPU, memory, and disk monitoring across all your servers with automated health checks and instant anomaly detection." },
+  { image: `${_base}images/monitoring_network.png`, title: "Network Traffic Analytics", desc: "Visualize bandwidth consumption, request rates, and latency metrics with geographic traffic mapping across all regions." },
+  { image: `${_base}images/monitoring_performance.png`, title: "Application Performance", desc: "Track response times, throughput, and error rates with service dependency mapping and bottleneck identification." },
+  { image: `${_base}images/monitoring_alerts.png`, title: "Alert Management", desc: "Configure intelligent alerting with severity levels, escalation policies, and incident timelines for rapid response." },
 ];
 
 const billingCards = [
-  { image: "/images/billing_overview.png", title: "Cost Overview Dashboard", desc: "Comprehensive monthly cost breakdown with spending trends, budget utilization tracking, and invoice summaries at a glance." },
-  { image: "/images/billing_usage.png", title: "Usage Breakdown", desc: "Detailed resource usage analysis by service — compute, storage, and networking costs broken down per team and project." },
-  { image: "/images/billing_invoices.png", title: "Invoice Management", desc: "Manage all invoices with payment status tracking, one-click downloads, and complete billing history in one place." },
-  { image: "/images/billing_forecast.png", title: "Budget Forecasting", desc: "AI-powered cost projections with confidence bands, budget vs. actual comparisons, and proactive savings recommendations." },
+  { image: `${_base}images/billing_overview.png`, title: "Cost Overview Dashboard", desc: "Comprehensive monthly cost breakdown with spending trends, budget utilization tracking, and invoice summaries at a glance." },
+  { image: `${_base}images/billing_usage.png`, title: "Usage Breakdown", desc: "Detailed resource usage analysis by service — compute, storage, and networking costs broken down per team and project." },
+  { image: `${_base}images/billing_invoices.png`, title: "Invoice Management", desc: "Manage all invoices with payment status tracking, one-click downloads, and complete billing history in one place." },
+  { image: `${_base}images/billing_forecast.png`, title: "Budget Forecasting", desc: "AI-powered cost projections with confidence bands, budget vs. actual comparisons, and proactive savings recommendations." },
 ];
 
 /* ── Carousel Component ── */
@@ -315,12 +316,12 @@ export default function Landing({ onNavigate }) {
           <div className="solution-cards">
             {/* Monitoring Card — image */}
             <div className="sol-img-card" onClick={() => setActiveCarousel("monitoring")}>
-              <img src="/images/card-monitoring.png" alt="Monitoring" className="sol-img" />
+              <img src={`${_base}images/card-monitoring.png`} alt="Monitoring" className="sol-img" />
             </div>
 
             {/* Billing Card — image */}
             <div className="sol-img-card" onClick={() => setActiveCarousel("billing")}>
-              <img src="/images/card-billing.png" alt="Billing" className="sol-img" />
+              <img src={`${_base}images/card-billing.png`} alt="Billing" className="sol-img" />
             </div>
           </div>
         </div>
