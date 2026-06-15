@@ -2,7 +2,12 @@ import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
 import ProviderLogo from './ProviderLogo';
 
-const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+function getApiBase() {
+  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/billing')) {
+    return '/billing/api';
+  }
+  return '/api';
+}
 
 /* ─── per-provider field schemas ─── */
 const SCHEMAS = {
@@ -131,10 +136,19 @@ function ProviderConnectCard({ provider, status, onConnect, onDisconnect }) {
     }
     setConnecting(true);
     try {
-      const payload = { provider, auth_type: authType, credentials: fields };
-      const res = await axios.post(`${BASE}/api/credentials/connect`, payload);
+      const uid = localStorage.getItem('cn_tool_uid') || '';
+      const payload = { provider, auth_type: authType, credentials: fields, uid };
+      const res = await axios.post(`${getApiBase()}/credentials/connect`, payload);
       if (res.data.success) {
-        onConnect(provider, res.data);
+        let credMeta = { authType };
+        if (provider === 'aws') {
+          credMeta = { authType, region: fields.region, accessKeyId: (fields.access_key_id || '').slice(0,4) + '****' };
+        } else if (provider === 'gcp') {
+          credMeta = { authType, projectId: fields.project_id };
+        } else if (provider === 'azure') {
+          credMeta = { authType, subscriptionId: fields.subscription_id, tenantId: fields.tenant_id, clientId: fields.client_id };
+        }
+        onConnect(provider, res.data, credMeta);
         setExpanded(false);
       } else {
         setError(res.data.error || 'Connection failed. Check your credentials and try again.');
@@ -299,10 +313,12 @@ export default function CloudConnectModal({ open, onClose, onAllConnected, initi
   const connectedCount = providers.filter(p => connections[p]?.connected).length;
   const allConnected = connectedCount === 3;
 
-  function handleConnect(provider, data) {
-    setConnections(prev => ({ ...prev, [provider]: { connected: true, ...data } }));
+  function handleConnect(provider, data, credMeta) {
+    setConnections(prev => ({ ...prev, [provider]: { connected: true, ...data, credMeta: credMeta || {} } }));
   }
-  function handleDisconnect(provider) {
+  async function handleDisconnect(provider) {
+    const uid = localStorage.getItem('cn_tool_uid') || '';
+    try { await axios.post(`${getApiBase()}/credentials/disconnect`, { provider, uid }); } catch {}
     setConnections(prev => ({ ...prev, [provider]: { connected: false } }));
   }
   function handleProceed() {

@@ -1,4 +1,5 @@
-import { useState, useEffect } from "react";
+import { Fragment, useState, useEffect, useRef } from "react";
+import { io as socketIO } from "socket.io-client";
 
 /* ── Icons ── */
 const CloudIcon = () => (
@@ -67,11 +68,16 @@ const BillingNavIcon = () => (
 const ArrowRightIcon = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
 );
+const RestoreIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+    <path d="M3 3v5h5"/>
+  </svg>
+);
 
 /* ── Helpers ── */
 const USERS_KEY    = "cn_admin_users";
 const ACTIVITY_KEY = "cn_user_activity";
-const PROFILE_KEY  = "cn_admin_profile";
 const SETTINGS_KEY = "cn_settings";
 
 function getUserPhoto(email) {
@@ -86,11 +92,12 @@ function saveGlobalSettings(s) {
 }
 const ONLINE_MS    = 90 * 1000; // 90 s — two missed 30-s heartbeats → offline
 
-function getAdminProfile() {
-  try { return JSON.parse(localStorage.getItem(PROFILE_KEY)); } catch { return null; }
+// Profile is keyed per-user so each admin/co-admin keeps their own photo/name
+function getAdminProfile(email) {
+  try { return JSON.parse(localStorage.getItem(`cn_admin_profile_${email}`)); } catch { return null; }
 }
-function saveAdminProfile(p) {
-  try { localStorage.setItem(PROFILE_KEY, JSON.stringify(p)); } catch {}
+function saveAdminProfile(email, p) {
+  try { localStorage.setItem(`cn_admin_profile_${email}`, JSON.stringify(p)); } catch {}
 }
 
 function getUsers() {
@@ -115,7 +122,15 @@ function fmtDuration(ms) {
 }
 function fmtDateTime(ts) {
   if (!ts) return "Never";
-  const d    = new Date(ts);
+  // SQLite datetime('now') stores UTC without "Z", so browsers parse it as local — wrong.
+  // Append "Z" to force UTC interpretation for old-format strings like "2026-06-15 04:10:23".
+  // ISO strings already have "Z" or "+" so they parse correctly as-is.
+  let d;
+  if (typeof ts === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(ts)) {
+    d = new Date(ts.replace(' ', 'T') + 'Z');
+  } else {
+    d = new Date(ts);
+  }
   const now  = new Date();
   const yest = new Date(now); yest.setDate(yest.getDate() - 1);
   const time = d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
@@ -131,7 +146,11 @@ function genPassword() {
   return p.sort(() => Math.random() - 0.5).join("");
 }
 function fmtDate(ts) {
-  return new Date(ts).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+  if (!ts) return "—";
+  const d = typeof ts === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(ts)
+    ? new Date(ts.replace(' ', 'T') + 'Z')
+    : new Date(ts);
+  return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
 }
 
 /* ── CSS ── */
@@ -294,6 +313,33 @@ const css = `
   box-shadow:0 24px 64px rgba(0,0,0,0.18); animation:apModalIn 0.22s ease;
 }
 @keyframes apModalIn { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
+@keyframes spin { to{transform:rotate(360deg)} }
+
+/* Restore Users section */
+.ap-restore-card {
+  background:#fff; border:1px solid #e2e8f0; border-radius:14px;
+  padding:20px 22px; display:flex; align-items:center; gap:16px;
+  box-shadow:0 1px 3px rgba(0,0,0,0.05); transition:box-shadow 0.18s;
+}
+.ap-restore-card:hover { box-shadow:0 4px 12px rgba(0,0,0,0.08); }
+.ap-restore-avatar {
+  width:38px; height:38px; border-radius:10px; background:linear-gradient(135deg,#dc2626,#f97316);
+  display:flex; align-items:center; justify-content:center;
+  font-size:14px; font-weight:800; color:#fff; flex-shrink:0;
+}
+.ap-restore-info { flex:1; min-width:0; }
+.ap-restore-name { font-size:14px; font-weight:700; color:#0f172a; }
+.ap-restore-meta { font-size:12px; color:#64748b; margin-top:2px; }
+.ap-restore-countdown { margin-top:8px; }
+.ap-restore-bar-bg { height:5px; border-radius:3px; background:#e2e8f0; overflow:hidden; }
+.ap-restore-bar-fill { height:100%; border-radius:3px; transition:width 0.3s; }
+.ap-restore-days { font-size:11px; font-weight:700; margin-top:4px; }
+.ap-restore-btn {
+  padding:8px 16px; border-radius:8px; border:none; cursor:pointer;
+  font-size:12px; font-weight:700; font-family:inherit;
+  background:#eff6ff; color:#2563eb; transition:all 0.18s; flex-shrink:0;
+}
+.ap-restore-btn:hover { background:#dbeafe; transform:translateY(-1px); }
 .ap-modal-header {
   padding:24px 28px 0; display:flex; align-items:center; justify-content:space-between;
 }
@@ -483,38 +529,675 @@ const css = `
 `;
 
 /* ── Main Component ── */
-export default function AdminPortal({ admin, onLogout }) {
-  const [section, setSection] = useState("users");
-  const [users, setUsers] = useState(getUsers);
+export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange }) {
+  const [section, setSection] = useState("tool-monitoring");
 
-  // Admin profile (name + photo) — persisted to localStorage
-  const [adminProfile, setAdminProfile] = useState(() => getAdminProfile() || { name: "Administrator", photo: null });
+  // ── WebSocket presence & live activity ──────────────────────────────────
+  const socketRef = useRef(null);
+  const [onlineUsers, setOnlineUsers] = useState([]); // [{email, name, loginTime}]
+  const [wsConnected, setWsConnected] = useState(false);
+  const [planCancelledBanner, setPlanCancelledBanner] = useState(false);
+
+  useEffect(() => {
+    const socket = socketIO(window.location.origin, { transports: ['websocket', 'polling'] });
+    socketRef.current = socket;
+
+    socket.on('connect', () => {
+      setWsConnected(true);
+      // Announce presence so the admin portal itself shows up as online
+      if (admin?.email) socket.emit('user:online', { email: admin.email, name: admin.name || admin.email });
+    });
+    socket.on('disconnect', () => setWsConnected(false));
+
+    socket.on('users:online', (list) => {
+      setOnlineUsers(list || []);
+      // Refresh users from DB so lastLogin reflects any recent logins
+      loadUsersFromDB(orgScope);
+    });
+
+    // Instant lastLogin update when any user logs in — no full reload needed
+    socket.on('user:login', ({ email, loginTime }) => {
+      setUsers(prev => prev.map(u =>
+        u.email?.toLowerCase() === email?.toLowerCase()
+          ? { ...u, lastLogin: loginTime }
+          : u
+      ));
+    });
+
+    socket.on('plan:cancelled', ({ email }) => {
+      if (email?.toLowerCase() === admin?.email?.toLowerCase()) {
+        setPlanCancelledBanner(true);
+      }
+    });
+
+    socket.on('activity:new', ({ email, type, details, ts }) => {
+      setUserActivity(prev => {
+        const key = email?.toLowerCase();
+        if (!key) return prev;
+        const existing = prev[key];
+        if (!existing || existing.loading) return prev;
+        const newEvent = { type, details: details || {}, ts: ts ? new Date(ts).toISOString() : new Date().toISOString() };
+        return { ...prev, [key]: { ...existing, events: [newEvent, ...(existing.events || [])] } };
+      });
+    });
+
+    return () => {
+      if (admin?.email) socket.emit('user:offline', { email: admin.email });
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [admin?.email]);
+
+  // Keep browser URL in sync with current admin section
+  useEffect(() => {
+    const slugMap = {
+      "users":           "/admin/users",
+      "restore":         "/admin/restore",
+      "access":          "/admin/access",
+      "plan":            "/admin/plan",
+      "account":         "/admin/account",
+      "settings":        "/admin/settings",
+      "tool-monitoring": "/admin/monitoring",
+      "tool-billing":    "/admin/billing",
+    };
+    const path = slugMap[section] ?? "/admin";
+    window.history.pushState({ page: "admin", section }, "", path);
+  }, [section]);
+
+  // Promoted sub-admins use their orgAdmin as the org scope; primary admins use their own email
+  const orgScope = admin?.orgAdmin || admin?.email;
+
+  // Always start empty — populated exclusively from DB, never from shared localStorage
+  const [users, setUsers] = useState([]);
+  const [usersLoading, setUsersLoading] = useState(true);
+  const [promoting, setPromoting] = useState(null);
+  const [promoteErr, setPromoteErr] = useState('');
+
+  // ── Load org users from DB with auto-retry ───────────────────────────────
+  const fetchUsersRef = useRef(null);
+
+  function loadUsersFromDB(scope) {
+    if (!scope) { setUsersLoading(false); return; }
+    setUsersLoading(true);
+    let attempts = 0;
+
+    function attempt() {
+      fetch(`/auth/users?admin=${encodeURIComponent(scope)}`)
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+        .then(dbUsers => {
+          if (!Array.isArray(dbUsers)) throw new Error('unexpected response');
+          setUsers(dbUsers.map(u => ({
+            id:         u.id,
+            name:       u.name,
+            email:      u.email,
+            role:       u.role || 'user',
+            mfaEnabled: u.mfaEnabled,
+            createdAt:  u.createdAt,
+            lastLogin:  u.lastLogin,
+            tools:      Array.isArray(u.tools) ? u.tools : ['monitoring', 'billing'],
+            photo:      u.photo || null,
+          })));
+          setUsersLoading(false);
+        })
+        .catch(() => {
+          attempts += 1;
+          if (attempts < 5) {
+            fetchUsersRef.current = setTimeout(attempt, Math.min(1000 * attempts, 4000));
+          } else {
+            setUsersLoading(false);
+          }
+        });
+    }
+    attempt();
+  }
+
+  useEffect(() => {
+    loadUsersFromDB(orgScope);
+    return () => { if (fetchUsersRef.current) clearTimeout(fetchUsersRef.current); };
+  }, [orgScope]); // eslint-disable-line
+
+  // ── Deleted users (soft-delete restore window) ────────────────────────────
+  const [deletedUsers, setDeletedUsers]   = useState([]);
+  const [deletedLoading, setDeletedLoading] = useState(false);
+
+  function loadDeletedUsers(scope) {
+    if (!scope) return;
+    setDeletedLoading(true);
+    fetch(`/auth/deleted-users?admin=${encodeURIComponent(scope)}`)
+      .then(r => r.json())
+      .then(list => { setDeletedUsers(Array.isArray(list) ? list : []); setDeletedLoading(false); })
+      .catch(() => setDeletedLoading(false));
+  }
+
+  useEffect(() => { loadDeletedUsers(orgScope); }, [orgScope]); // eslint-disable-line
+
+  function handleRestoreUser(u) {
+    if (!window.confirm(`Restore ${u.name || u.email}? They will be able to log in again.`)) return;
+    fetch('/auth/restore-user', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: u.email, adminEmail: orgScope }),
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.success) {
+          setDeletedUsers(prev => prev.filter(d => d.email !== u.email));
+          loadUsersFromDB(orgScope);
+        }
+      })
+      .catch(() => {});
+  }
+
+  // ── Admin profile — load from DB then fall back to localStorage ────────────
+  const [adminProfile, setAdminProfile] = useState(() => getAdminProfile(admin?.email) || { name: admin?.name || 'Administrator', photo: null });
   const [editMode, setEditMode]   = useState(false);
-  const [editName, setEditName]   = useState("");
+  const [editName, setEditName]   = useState('');
   const [editPhoto, setEditPhoto] = useState(null);
+
+  function syncAdminDataFromDB() {
+    if (!orgScope) return;
+    const isCoAdmin = !!admin?.orgAdmin;
+    fetch(`/auth/admin-data/${encodeURIComponent(orgScope)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data || data.error) return;
+        if (isCoAdmin) {
+          // Co-admins: only take plan data from org admin record; use own name/photo
+          fetch(`/auth/photo/${encodeURIComponent(admin.email)}`)
+            .then(r => r.json())
+            .then(pd => {
+              const ownPhoto = pd?.photo || getUserPhoto(admin.email) || null;
+              const updated  = { name: admin.name || adminProfile.name, photo: ownPhoto };
+              saveAdminProfile(admin.email, updated);
+              if (ownPhoto && admin?.email) {
+                try { localStorage.setItem(`cn_user_photo_${admin.email}`, ownPhoto); } catch {}
+              }
+              setAdminProfile(updated);
+            })
+            .catch(() => {
+              const updated = { name: admin.name || adminProfile.name, photo: getUserPhoto(admin.email) || adminProfile.photo };
+              saveAdminProfile(admin.email, updated);
+              setAdminProfile(updated);
+            });
+        } else {
+          const photo = data.photo || adminProfile.photo;
+          const updated = { name: data.name || adminProfile.name, photo };
+          saveAdminProfile(admin.email, updated);
+          if (photo && admin?.email) {
+            try { localStorage.setItem(`cn_user_photo_${admin.email}`, photo); } catch {}
+          }
+          setAdminProfile(updated);
+        }
+
+        if (data.plan) {
+          const s = getGlobalSettings();
+          const patch = { ...s, currentPlan: data.plan };
+          if (data.planPurchasedAt && !s.planPurchasedAt) patch.planPurchasedAt = data.planPurchasedAt;
+          if (data.planPausedAt) patch.planPausedAt = data.planPausedAt;
+          else delete patch.planPausedAt;
+          saveGlobalSettings(patch);
+          setSettings(prev => ({
+            ...prev,
+            currentPlan: data.plan,
+            planPurchasedAt: patch.planPurchasedAt || prev.planPurchasedAt,
+            planPausedAt: data.planPausedAt || null,
+          }));
+          setShowPlans(true);
+          // Push purchasedAt to DB if DB is missing it but localStorage has it
+          const localPurchasedAt = patch.planPurchasedAt || s.planPurchasedAt;
+          if (!data.planPurchasedAt && localPurchasedAt && orgScope) {
+            fetch('/auth/plan', {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ email: orgScope, plan: data.plan, purchasedAt: localPurchasedAt }),
+            }).catch(() => {});
+          }
+        } else {
+          // Plan was cancelled by super admin — clear it locally too
+          const s = getGlobalSettings();
+          const cleared = { ...s };
+          delete cleared.currentPlan; delete cleared.planPurchasedAt;
+          delete cleared.planPaymentId; delete cleared.planPausedAt;
+          saveGlobalSettings(cleared);
+          setSettings(prev => ({ ...prev, currentPlan: null, planPurchasedAt: null, planPausedAt: null, planPaymentId: null }));
+        }
+      })
+      .catch(() => {});
+  }
+
+  // Load on mount + re-poll every 30 s to catch super-admin plan changes
+  useEffect(() => {
+    syncAdminDataFromDB();
+    const id = setInterval(syncAdminDataFromDB, 30000);
+    return () => clearInterval(id);
+  }, [admin?.email]); // eslint-disable-line
 
   function openEdit() {
     setEditName(adminProfile.name);
     setEditPhoto(adminProfile.photo);
     setEditMode(true);
   }
+  function _compressPhoto(dataUrl) {
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = () => {
+        const MAX = 256;
+        const scale = Math.min(MAX / Math.max(img.width, img.height), 1);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = Object.assign(document.createElement('canvas'), { width: w, height: h });
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.85));
+      };
+      img.onerror = () => resolve(dataUrl);
+      img.src = dataUrl;
+    });
+  }
+
   function saveProfile() {
-    const updated = { name: editName.trim() || "Administrator", photo: editPhoto };
-    saveAdminProfile(updated);
+    const updated = { name: editName.trim() || 'Administrator', photo: editPhoto };
+    saveAdminProfile(admin?.email, updated);
     setAdminProfile(updated);
+    // Mirror to the hub photo key so it persists across portal/hub switches
+    if (admin?.email && editPhoto) {
+      try { localStorage.setItem(`cn_user_photo_${admin.email}`, editPhoto); } catch {}
+      onPhotoChange?.(editPhoto);
+    }
     setEditMode(false);
+    if (admin?.email) {
+      fetch('/auth/photo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: admin.email, photo: editPhoto }),
+      }).catch(() => {});
+    }
   }
   function handlePhotoChange(e) {
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = ev => setEditPhoto(ev.target.result);
+    reader.onload = async ev => {
+      const compressed = await _compressPhoto(ev.target.result);
+      setEditPhoto(compressed);
+    };
     reader.readAsDataURL(file);
   }
 
   // User activity log — expandable rows
   const [expandedUsers,  setExpandedUsers]  = useState(new Set());
   const [userActivity,   setUserActivity]   = useState({}); // email -> { loading, events }
+  const [exportModal,    setExportModal]    = useState(null); // null | { target:'all'|user, events:[], dateFrom:'', dateTo:'' }
+
+  function filterByDate(events, from, to) {
+    if (!from && !to) return events;
+    return events.filter(ev => {
+      if (!ev.ts) return true;
+      const d = new Date(ev.ts);
+      const p = n => String(n).padStart(2, '0');
+      const localDate = `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`;
+      if (from && localDate < from) return false;
+      if (to   && localDate > to)   return false;
+      return true;
+    });
+  }
+
+  function formatEventLine(ev) {
+    const d = ev.ts ? new Date(ev.ts) : new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const ts = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+    const tagMap = {
+      session_start: 'SESSION', tab_viewed: 'VIEW', cloud_connected: 'CONNECT',
+      cloud_disconnected: 'DISCONNECT', report_exported: 'EXPORT',
+      alert_acknowledged: 'ACK', invoice_viewed: 'INVOICE',
+      login: 'LOGIN', register: 'REGISTER',
+    };
+    const tag = tagMap[ev.type] || ev.type.toUpperCase().replace(/_/g, ' ');
+
+    const det = ev.details || {};
+    const toolLower    = (det.tool     || '').toLowerCase();
+    const tabLower     = (det.tab      || '').toLowerCase().replace(/\s+/g, '-');
+    const providerLow  = (det.provider || '').toLowerCase();
+
+    // ── Derive path ──────────────────────────────────────────────────────────
+    let path = det.path || ''; // prefer stored path from newer events
+    if (!path) {
+      if      (ev.type === 'session_start')                     path = `cloudnexus.com/${toolLower || 'monitoring'}`;
+      else if (ev.type === 'tab_viewed')                        path = `cloudnexus.com/${toolLower || 'monitoring'}/${tabLower || 'overview'}`;
+      else if (ev.type === 'cloud_connected'  && providerLow)   path = `cloudnexus.com/monitoring/connections/${providerLow}`;
+      else if (ev.type === 'cloud_disconnected' && providerLow) path = `cloudnexus.com/monitoring/connections/${providerLow}`;
+      else if (ev.type === 'report_exported')                   path = `cloudnexus.com/${toolLower || 'monitoring'}/export`;
+      else if (ev.type === 'alert_acknowledged')                path = `cloudnexus.com/monitoring/alerts`;
+      else if (ev.type === 'invoice_viewed')                    path = `cloudnexus.com/billing/invoices`;
+      else if (ev.type === 'login' || ev.type === 'register')   path = `cloudnexus.com/login`;
+      else                                                       path = `cloudnexus.com`;
+    }
+
+    // ── Derive action ────────────────────────────────────────────────────────
+    let action = '';
+    if      (ev.type === 'session_start')       action = `opened ${toolLower || 'tool'}`;
+    else if (ev.type === 'tab_viewed')           action = `visited ${det.tab || tabLower} tab`;
+    else if (ev.type === 'cloud_connected') {
+      const creds = det.credentials || {};
+      let extra = '';
+      if (creds.region)        extra += `  region:${creds.region}`;
+      if (creds.projectId)     extra += `  project:${creds.projectId}`;
+      if (creds.subscriptionId)extra += `  sub:${creds.subscriptionId}`;
+      action = `connected ${(det.provider||'').toUpperCase()} account${extra}`;
+    }
+    else if (ev.type === 'cloud_disconnected')   action = `disconnected ${(det.provider||'').toUpperCase()} account`;
+    else if (ev.type === 'report_exported')      action = `exported ${toolLower || 'monitoring'} report`;
+    else if (ev.type === 'alert_acknowledged')   action = `acknowledged alert${det.name ? ': '+det.name : ''}`;
+    else if (ev.type === 'invoice_viewed')       action = `viewed invoice${det.invoice ? ' '+det.invoice : ''}`;
+    else if (ev.type === 'login')                action = 'signed in';
+    else if (ev.type === 'register')             action = 'created account';
+    else                                         action = ev.type.replace(/_/g, ' ');
+
+    return { ts, tag, path, action };
+  }
+
+  function triggerDownload(filename, html) {
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function dateLabel(from, to) {
+    if (from && to) return `${from}  →  ${to}`;
+    if (from) return `From ${from}`;
+    if (to)   return `Up to ${to}`;
+    return 'All time';
+  }
+
+  const LOG_CSS = `
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'Segoe UI',system-ui,sans-serif;background:#f1f5f9;color:#1e293b;padding:32px}
+    .report{max-width:980px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,0.10)}
+    .rh{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);padding:28px 40px;display:flex;align-items:center;justify-content:space-between}
+    .brand{display:flex;align-items:center;gap:14px}
+    .bicon{width:42px;height:42px;background:linear-gradient(135deg,#38bdf8,#818cf8);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:800;color:#fff;letter-spacing:-1px}
+    .bname{font-size:20px;font-weight:800;color:#f8fafc;letter-spacing:-0.3px}
+    .bsub{font-size:10px;color:#475569;margin-top:2px;letter-spacing:1px;text-transform:uppercase}
+    .rmeta{text-align:right}
+    .rmeta .rl{font-size:10px;color:#475569;letter-spacing:1px;text-transform:uppercase;margin-bottom:2px}
+    .rmeta .rv{font-size:12px;color:#94a3b8}
+    .ucard{background:#f8fafc;border-bottom:1px solid #e2e8f0;padding:22px 40px;display:flex;align-items:center;gap:20px}
+    .uav{width:50px;height:50px;background:linear-gradient(135deg,#38bdf8,#818cf8);border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:700;color:#fff;flex-shrink:0}
+    .uname{font-size:16px;font-weight:700;color:#0f172a}
+    .uemail{font-size:12px;color:#64748b;margin-top:2px}
+    .stats{margin-left:auto;display:flex;gap:28px}
+    .st{text-align:center}
+    .sv{font-size:24px;font-weight:800;color:#0f172a}
+    .sl{font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}
+    .dbar{background:#fff;border-bottom:1px solid #e2e8f0;padding:10px 40px;display:flex;align-items:center;gap:10px;font-size:12px;color:#64748b;flex-wrap:wrap}
+    .dbar strong{color:#0f172a}
+    .pill{display:inline-flex;align-items:center;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    thead tr{background:#f8fafc}
+    th{padding:11px 16px;text-align:left;font-size:10px;font-weight:700;color:#94a3b8;letter-spacing:1px;text-transform:uppercase;border-bottom:2px solid #e2e8f0}
+    td{padding:10px 16px;border-bottom:1px solid #f1f5f9;vertical-align:middle}
+    tr:last-child td{border-bottom:none}
+    tr:nth-child(even) td{background:#fafbfc}
+    .tc{font-family:'Courier New',monospace;font-size:11px;color:#64748b;white-space:nowrap}
+    .tg{white-space:nowrap}
+    .tp{display:inline-flex;align-items:center;padding:3px 11px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:0.3px}
+    .tSESSION{background:#e0f2fe;color:#0369a1}
+    .tVIEW{background:#ede9fe;color:#6d28d9}
+    .tCONNECT{background:#dcfce7;color:#15803d}
+    .tDISCONNECT{background:#fee2e2;color:#dc2626}
+    .tEXPORT{background:#fef9c3;color:#a16207}
+    .tACK{background:#d1fae5;color:#065f46}
+    .tINVOICE{background:#cffafe;color:#0e7490}
+    .tDEFAULT{background:#f1f5f9;color:#475569}
+    .mc{color:#334155;font-size:13px}
+    .rf{background:#f8fafc;border-top:1px solid #e2e8f0;padding:14px 40px;display:flex;align-items:center;justify-content:space-between;font-size:11px;color:#94a3b8}
+    .ush{background:#f8fafc;border-top:3px solid #e2e8f0;border-left:4px solid #38bdf8;padding:18px 40px;display:flex;align-items:center;justify-content:space-between;page-break-before:always}
+    .ush:first-child{border-top:none;page-break-before:auto}
+    .ushn{font-size:14px;font-weight:700;color:#0f172a}
+    .ushe{font-size:12px;color:#64748b;margin-top:2px}
+    .empty{padding:20px 40px;font-size:12px;color:#94a3b8;font-style:italic}
+    @media print{
+      body{background:#fff;padding:0;margin:0}
+      .report{box-shadow:none;border-radius:0;margin:0;max-width:100%}
+      .rh{padding:14px 24px}
+      .ucard{padding:10px 24px}
+      .dbar{padding:6px 24px}
+      .ush{padding:10px 24px}
+      td{padding:6px 12px}
+      th{padding:7px 12px}
+      .rf{padding:10px 24px}
+    }
+  `;
+
+  function tagPill(tag) {
+    const cls = ['SESSION','VIEW','CONNECT','DISCONNECT','EXPORT','ACK','INVOICE'].includes(tag) ? tag : 'DEFAULT';
+    return `<span class="tp t${cls}">${tag}</span>`;
+  }
+
+  function logRows(events) {
+    if (!events.length) return `<tr><td colspan="4" class="empty">No events in this range.</td></tr>`;
+    return events.map(ev => {
+      const { ts, tag, path, action } = formatEventLine(ev);
+      return `<tr><td class="tc">${ts}</td><td class="tg">${tagPill(tag)}</td><td class="mc" style="font-family:monospace;color:#2563eb">${path}</td><td class="mc">${action}</td></tr>`;
+    }).join('');
+  }
+
+  function countByType(events) {
+    const counts = {};
+    events.forEach(ev => { counts[ev.type] = (counts[ev.type] || 0) + 1; });
+    return counts;
+  }
+
+  function generateUserLogHTML(user, events) {
+    const now = new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+    const safe = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const c = countByType(events);
+    const initial = (user.name || user.email)[0].toUpperCase();
+    return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>CloudNexus Audit Log — ${safe(user.email)}</title>
+<style>${LOG_CSS}</style></head><body>
+<div class="report">
+  <div class="rh">
+    <div class="brand">
+      <div class="bicon">CN</div>
+      <div><div class="bname">CloudNexus</div><div class="bsub">Audit Log Report</div></div>
+    </div>
+    <div class="rmeta">
+      <div class="rl">Exported</div><div class="rv">${now}</div>
+      <div class="rl" style="margin-top:8px">Date Range</div><div class="rv">All events</div>
+    </div>
+  </div>
+  <div class="ucard">
+    <div class="uav">${safe(initial)}</div>
+    <div>
+      <div class="uname">${safe(user.name || user.email)}</div>
+      <div class="uemail">${safe(user.email)}</div>
+    </div>
+    <div class="stats">
+      <div class="st"><div class="sv">${events.length}</div><div class="sl">Events</div></div>
+      ${c.cloud_connected   ? `<div class="st"><div class="sv" style="color:#15803d">${c.cloud_connected}</div><div class="sl">Connected</div></div>` : ''}
+      ${c.tab_viewed        ? `<div class="st"><div class="sv" style="color:#6d28d9">${c.tab_viewed}</div><div class="sl">Tabs viewed</div></div>` : ''}
+      ${c.report_exported   ? `<div class="st"><div class="sv" style="color:#a16207">${c.report_exported}</div><div class="sl">Exports</div></div>` : ''}
+    </div>
+  </div>
+  <div class="dbar">
+    <strong>Period:</strong> All events
+    &nbsp;·&nbsp; <strong>${events.length}</strong> event${events.length!==1?'s':''}
+    &nbsp;·&nbsp; User: ${safe(user.email)}
+  </div>
+  <div class="log-table-wrap">
+    <table>
+      <thead><tr><th>Timestamp</th><th>Event</th><th>Details</th></tr></thead>
+      <tbody>${logRows(events)}</tbody>
+    </table>
+  </div>
+  <div class="rf">
+    <span>CloudNexus Admin Portal &mdash; Confidential</span>
+    <span>Generated ${now}</span>
+  </div>
+</div>
+</body></html>`;
+  }
+
+  function generateAllLogsHTML(loadedUsers, dateFrom, dateTo) {
+    const now = new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+    const safe = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const dateRangeLabel = dateFrom && dateTo ? `${dateFrom} → ${dateTo}` : dateFrom ? `From ${dateFrom}` : dateTo ? `Up to ${dateTo}` : 'All events';
+    const totalEvents = loadedUsers.reduce((sum, u) => sum + filterByDate(userActivity[u.email]?.events || [], dateFrom, dateTo).length, 0);
+    const sections = loadedUsers.map((u, idx) => {
+      const filtered = filterByDate(userActivity[u.email]?.events || [], dateFrom, dateTo);
+      const initial = (u.name || u.email)[0].toUpperCase();
+      const c = countByType(filtered);
+      return `
+  <div class="ush" style="${idx === 0 ? 'page-break-before:auto;border-top:none' : ''}">
+    <div>
+      <div class="ushn">${safe(u.name || u.email)}</div>
+      <div class="ushe">${safe(u.email)}</div>
+    </div>
+    <div style="display:flex;gap:24px;align-items:center">
+      <div class="st"><div class="sv">${filtered.length}</div><div class="sl">Events</div></div>
+      ${c.cloud_connected ? `<div class="st"><div class="sv" style="color:#15803d">${c.cloud_connected}</div><div class="sl">Connected</div></div>` : ''}
+      ${c.tab_viewed      ? `<div class="st"><div class="sv" style="color:#6d28d9">${c.tab_viewed}</div><div class="sl">Views</div></div>` : ''}
+    </div>
+  </div>
+  <table>
+    <thead><tr><th>Timestamp</th><th>Event</th><th>Details</th></tr></thead>
+    <tbody>${logRows(filtered)}</tbody>
+  </table>`;
+    }).join('');
+    return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<title>CloudNexus Audit Logs — All Users</title>
+<style>${LOG_CSS}</style></head><body>
+<div class="report">
+  <div class="rh">
+    <div class="brand">
+      <div class="bicon">CN</div>
+      <div><div class="bname">CloudNexus</div><div class="bsub">Combined Audit Log</div></div>
+    </div>
+    <div class="rmeta">
+      <div class="rl">Exported</div><div class="rv">${now}</div>
+      <div class="rl" style="margin-top:8px">Date Range</div><div class="rv">${dateRangeLabel}</div>
+    </div>
+  </div>
+  <div class="dbar">
+    <strong>Period:</strong> ${dateRangeLabel}
+    &nbsp;·&nbsp; <strong>${loadedUsers.length}</strong> user${loadedUsers.length!==1?'s':''}
+    &nbsp;·&nbsp; <strong>${totalEvents}</strong> total event${totalEvents!==1?'s':''}
+  </div>
+  ${sections}
+  <div class="rf">
+    <span>CloudNexus Admin Portal &mdash; Confidential</span>
+    <span>Generated ${now}</span>
+  </div>
+</div>
+</body></html>`;
+  }
+
+  function printAsPDF(html) {
+    // Inject auto-print script into the HTML before opening
+    const printHtml = html.replace('</body>', `<script>window.onload=function(){setTimeout(function(){window.print();},400);};<\/script></body>`);
+    const blob = new Blob([printHtml], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank');
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
+  }
+
+  function filenameDateStr(from, to) {
+    if (from && to && from === to) return from;
+    if (from && to) return `${from}_to_${to}`;
+    if (from) return `from_${from}`;
+    if (to)   return `to_${to}`;
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  function csvMeta(userLabel) {
+    const now = new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' });
+    const period = 'All events';
+    const lines = [
+      `# CloudNexus Audit Log`,
+      userLabel ? `# User: ${userLabel}` : `# Report: All Users`,
+      `# Period: ${period}`,
+      `# Exported: ${now}`,
+      `#`,
+    ];
+    return lines.join('\r\n') + '\r\n';
+  }
+
+  function generateCSV(events, userLabel) {
+    const esc = v => '"' + String(v || '').replace(/"/g, '""') + '"';
+    const header = ['Timestamp','Tag','Path','Action'].map(esc).join(',');
+    const rows = events.map(ev => {
+      const { ts, tag, path, action } = formatEventLine(ev);
+      return [ts, tag, path, action].map(esc).join(',');
+    });
+    return '﻿' + csvMeta(userLabel) + [header, ...rows].join('\r\n');
+  }
+
+  function generateAllCSV(loadedUsers, dateFrom, dateTo) {
+    const esc = v => '"' + String(v || '').replace(/"/g, '""') + '"';
+    const header = ['User Name','Email','Timestamp','Tag','Path','Action'].map(esc).join(',');
+    const rows = [];
+    loadedUsers.forEach(u => {
+      filterByDate(userActivity[u.email]?.events || [], dateFrom, dateTo).forEach(ev => {
+        const { ts, tag, path, action } = formatEventLine(ev);
+        rows.push([u.name || u.email, u.email, ts, tag, path, action].map(esc).join(','));
+      });
+    });
+    return '﻿' + csvMeta(null) + [header, ...rows].join('\r\n');
+  }
+
+  function blobDownload(filename, content, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.style.display = 'none';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function downloadUserLog(user, events, fmt, dateFrom, dateTo) {
+    const safeEmail = user.email.replace(/[^a-z0-9._-]/gi, '_');
+    const datePart = filenameDateStr(dateFrom, dateTo);
+    if (fmt === 'pdf') {
+      printAsPDF(generateUserLogHTML(user, events));
+    } else if (fmt === 'csv') {
+      blobDownload(
+        `cloudnexus-log-${safeEmail}-${datePart}.csv`,
+        generateCSV(events, user.email),
+        'text/csv;charset=utf-8'
+      );
+    }
+  }
+
+  function downloadAllLogs(fmt, dateFrom, dateTo) {
+    const loaded = users.filter(u => userActivity[u.email] && !userActivity[u.email].loading);
+    if (!loaded.length) { alert('Expand at least one user row to load their activity first.'); return; }
+    const datePart = filenameDateStr(dateFrom, dateTo);
+    if (fmt === 'pdf') {
+      printAsPDF(generateAllLogsHTML(loaded, dateFrom, dateTo));
+    } else if (fmt === 'csv') {
+      blobDownload(
+        `cloudnexus-logs-all-${datePart}.csv`,
+        generateAllCSV(loaded, dateFrom, dateTo),
+        'text/csv;charset=utf-8'
+      );
+    }
+  }
+
+  function doExportFromModal(fmt) {
+    const { target, events, dateFrom, dateTo } = exportModal;
+    if (target === 'all') {
+      downloadAllLogs(fmt, dateFrom, dateTo);
+    } else {
+      downloadUserLog(target, filterByDate(events, dateFrom, dateTo), fmt, dateFrom, dateTo);
+    }
+    setExportModal(null);
+  }
 
   function toggleActivityRow(email) {
     setExpandedUsers(prev => {
@@ -526,7 +1209,7 @@ export default function AdminPortal({ admin, onLogout }) {
     setUserActivity(prev => {
       if (prev[email]) return prev; // already loaded
       const updated = { ...prev, [email]: { loading: true, events: [] } };
-      fetch(`http://localhost:3001/api/activity/${encodeURIComponent(email)}`)
+      fetch(`/api/activity/${encodeURIComponent(email)}`)
         .then(r => r.json())
         .then(data => setUserActivity(p => ({ ...p, [email]: { loading: false, events: data.events || [] } })))
         .catch(() => setUserActivity(p => ({ ...p, [email]: { loading: false, events: [] } })));
@@ -596,12 +1279,25 @@ export default function AdminPortal({ admin, onLogout }) {
               const updated = { ...s, currentPlan: planLabel, planPaymentId: response.razorpay_payment_id, planPurchasedAt: purchasedAt };
               localStorage.setItem("cn_settings", JSON.stringify(updated));
               setSettings(prev => ({ ...prev, currentPlan: planLabel, planPaymentId: response.razorpay_payment_id, planPurchasedAt: purchasedAt }));
-              // Auto-strip tools no longer included in the new plan
+              // Persist plan to DB under the org primary admin's email
+              if (orgScope) {
+                fetch('/auth/plan', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: orgScope, plan: planLabel, purchasedAt }) }).catch(() => {});
+              }
+              // Auto-strip tools no longer included in the new plan and persist to DB
               const newAllowed = (PLAN_RESTRICTIONS[planLabel] || { allowedTools: ["monitoring","billing"] }).allowedTools;
-              const currentUsers = getUsers();
-              const stripped = currentUsers.map(u => ({ ...u, tools: u.tools.filter(t => newAllowed.includes(t)) }));
-              saveUsers(stripped);
-              setUsers(stripped);
+              setUsers(prev => prev.map(u => ({ ...u, tools: (u.tools || []).filter(t => newAllowed.includes(t)) })));
+              if (orgScope) {
+                users.forEach(u => {
+                  const strippedTools = (u.tools || []).filter(t => newAllowed.includes(t));
+                  if (strippedTools.length < (u.tools || []).length) {
+                    fetch(`/auth/users/${encodeURIComponent(u.email)}/tools`, {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ tools: strippedTools, admin: orgScope }),
+                    }).catch(() => {});
+                  }
+                });
+              }
             } else {
               setPayState({ loading: false, planName: planLabel, error: "Payment verification failed. Please contact support.", success: "" });
             }
@@ -657,10 +1353,28 @@ export default function AdminPortal({ admin, onLogout }) {
     delete next.planPurchasedAt;
     saveGlobalSettings(next);
     setSettings(next);
-    const restored = getUsers().map(u => ({ ...u, tools: ["monitoring", "billing"] }));
-    saveUsers(restored);
-    setUsers(restored);
+    setUsers(prev => prev.map(u => ({ ...u, tools: ["monitoring", "billing"] })));
+    // Restore full tool access in DB for all users when plan is cancelled
+    if (orgScope) {
+      users.forEach(u => {
+        if (!(u.tools || []).includes("monitoring") || !(u.tools || []).includes("billing")) {
+          fetch(`/auth/users/${encodeURIComponent(u.email)}/tools`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tools: ["monitoring", "billing"], admin: orgScope }),
+          }).catch(() => {});
+        }
+      });
+    }
     setPayState({ loading: false, planName: "", error: "", success: "" });
+    // Persist cancellation to DB so plan is not restored on page refresh
+    if (orgScope) {
+      fetch('/auth/plan', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: orgScope, plan: null, purchasedAt: null }),
+      }).catch(() => {});
+    }
   }
 
   // Plan-based restrictions
@@ -668,12 +1382,23 @@ export default function AdminPortal({ admin, onLogout }) {
     "Monitoring Bundle": { allowedTools: ["monitoring"], maxUsers: 1 },
     "Billing Bundle":    { allowedTools: ["billing"],    maxUsers: 1 },
     "Standard Pro":      { allowedTools: ["monitoring", "billing"], maxUsers: 3 },
-    "Professional":      { allowedTools: ["monitoring", "billing"], maxUsers: 5 },
+    "Professional":      { allowedTools: ["monitoring", "billing"], maxUsers: 8, maxToolUsers: { monitoring: 3, billing: 3 } },
     "Enterprise":        { allowedTools: ["monitoring", "billing"], maxUsers: Infinity },
   };
   const planRestrictions = settings.currentPlan
     ? (PLAN_RESTRICTIONS[settings.currentPlan] || { allowedTools: ["monitoring", "billing"], maxUsers: Infinity })
     : { allowedTools: ["monitoring", "billing"], maxUsers: Infinity };
+
+  // Correct default section if monitoring is not on this plan
+  useEffect(() => {
+    const allowed = planRestrictions.allowedTools;
+    setSection(prev => {
+      if (prev === "tool-monitoring" && !allowed.includes("monitoring")) {
+        return allowed.includes("billing") ? "tool-billing" : "users";
+      }
+      return prev;
+    });
+  }, []); // eslint-disable-line
 
   // Backfill planPurchasedAt + auto-strip disallowed tools on mount
   useEffect(() => {
@@ -685,14 +1410,11 @@ export default function AdminPortal({ admin, onLogout }) {
     }
     // Strip tools that the current plan does not include
     const allowed = planRestrictions.allowedTools;
-    const existing = getUsers();
-    const needsFix = existing.some(u => u.tools.some(t => !allowed.includes(t)));
-    if (needsFix) {
-      const fixed = existing.map(u => ({ ...u, tools: u.tools.filter(t => allowed.includes(t)) }));
-      saveUsers(fixed);
-      setUsers(fixed);
-    }
-  }, []);
+    setUsers(prev => {
+      const needsFix = prev.some(u => (u.tools || []).some(t => !allowed.includes(t)));
+      return needsFix ? prev.map(u => ({ ...u, tools: (u.tools || []).filter(t => allowed.includes(t)) })) : prev;
+    });
+  }, []); // eslint-disable-line
 
   // Auto-refresh every 30 s so online status and session timers stay current
   const [, setTick] = useState(0);
@@ -703,26 +1425,54 @@ export default function AdminPortal({ admin, onLogout }) {
 
   // Start / cancel over-limit countdown whenever user count or plan changes
   useEffect(() => {
+    if (!orgScope) return;
     const { maxUsers } = planRestrictions;
+    const storageKey = `cn_overlimit_start_${orgScope}`;
     if (maxUsers !== Infinity && users.length > maxUsers) {
-      setOverLimitSecs(prev => prev === null ? 60 : prev); // start only if not already running
-    } else {
-      setOverLimitSecs(null); // admin resolved it manually — cancel
+      setOverLimitSecs(prev => {
+        if (prev !== null) return prev; // timer already running — don't restart
+        // Check if a countdown was already in progress before the last page refresh
+        const stored = localStorage.getItem(storageKey);
+        if (stored) {
+          const elapsed = Math.floor((Date.now() - Number(stored)) / 1000);
+          return Math.max(0, 60 - elapsed); // resume from where it left off
+        }
+        // Fresh over-limit situation — record start time so refresh can resume it
+        localStorage.setItem(storageKey, String(Date.now()));
+        return 60;
+      });
+    } else if (users.length > 0) {
+      // Users are definitely loaded and within limits — cancel any running timer
+      setOverLimitSecs(null);
+      localStorage.removeItem(storageKey);
     }
-  }, [users.length, settings.currentPlan]); // eslint-disable-line
+    // If users.length === 0 the fetch hasn't returned yet — don't touch the timer
+  }, [users.length, settings.currentPlan, orgScope]); // eslint-disable-line
 
   // Countdown ticker + auto-remove at 0
   useEffect(() => {
     if (overLimitSecs === null || overLimitSecs < 0) return;
     if (overLimitSecs === 0) {
-      // Time's up — keep the oldest N users, remove the rest
+      // Time's up — keep the oldest N users, permanently delete the rest
       const { maxUsers } = planRestrictions;
       if (maxUsers !== Infinity && users.length > maxUsers) {
-        const sorted = [...users].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-        const kept   = sorted.slice(0, maxUsers);
-        saveUsers(kept);
+        const sorted  = [...users].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+        const kept    = sorted.slice(0, maxUsers);
+        const removed = sorted.slice(maxUsers);
+        removed.forEach(u => {
+          const adminParam = encodeURIComponent(orgScope || '');
+          fetch(`/auth/users/${encodeURIComponent(u.email)}?admin=${adminParam}&deletedBy=${adminParam}`, { method: 'DELETE' })
+            .then(() => loadDeletedUsers(orgScope))
+            .catch(() => {});
+          try {
+            const revoked = JSON.parse(localStorage.getItem('cn_revoked_sessions') || '{}');
+            revoked[u.email.toLowerCase()] = Date.now();
+            localStorage.setItem('cn_revoked_sessions', JSON.stringify(revoked));
+          } catch {}
+        });
         setUsers(kept);
       }
+      if (orgScope) localStorage.removeItem(`cn_overlimit_start_${orgScope}`);
       setOverLimitSecs(null);
       return;
     }
@@ -737,7 +1487,7 @@ export default function AdminPortal({ admin, onLogout }) {
   const [oneTimePass, setOneTimePass] = useState("");
   const [copied, setCopied] = useState(false);
 
-  const updateUsers = (list) => { saveUsers(list); setUsers(list); };
+  const updateUsers = (list) => { setUsers(list); };
 
   /* ── Create user ── */
   function handleCreate() {
@@ -765,6 +1515,21 @@ export default function AdminPortal({ admin, onLogout }) {
 
     const pwd = form.passType === "auto" ? genPassword() : form.password;
     const newUser = { id: "u_" + Date.now(), name: form.name.trim(), email: form.email.trim(), password: pwd, tools: planRestrictions.allowedTools, createdAt: Date.now() };
+
+    // Clear any prior revocation for this email so a re-created user isn't locked out
+    try {
+      const revoked = JSON.parse(localStorage.getItem('cn_revoked_sessions') || '{}');
+      delete revoked[form.email.trim().toLowerCase()];
+      localStorage.setItem('cn_revoked_sessions', JSON.stringify(revoked));
+    } catch {}
+
+    // Register in backend DB under this admin's org
+    fetch('/auth/register-org-user', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: form.name.trim(), email: form.email.trim(), password: pwd, orgAdmin: orgScope, tools: planRestrictions.allowedTools }),
+    }).catch(() => {});
+
     updateUsers([...users, newUser]);
     setFormErr("");
 
@@ -792,35 +1557,118 @@ export default function AdminPortal({ admin, onLogout }) {
   function deleteUser(id) {
     const target = users.find(u => u.id === id);
     if (!target) return;
-    if (window.confirm(`Delete ${target.name}? Their session will be terminated immediately.`)) {
-      // Revoke on backend (port 3001) so monitoring/billing tools detect it and hub API poll catches it
-      fetch("http://localhost:3001/api/revoke-session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
+    if (window.confirm(`Delete ${target.name}? They will be blocked from logging in. You can restore them within 7 days from the Restore Users section.`)) {
+      const adminParam   = encodeURIComponent(orgScope || '');
+      const deletedByParam = encodeURIComponent(orgScope || '');
+      fetch(`/auth/users/${encodeURIComponent(target.email)}?admin=${adminParam}&deletedBy=${deletedByParam}`, { method: 'DELETE' })
+        .then(() => loadDeletedUsers(orgScope))
+        .catch(() => {});
+      fetch('/api/revoke-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: target.email }),
       }).catch(() => {});
-      // Write to localStorage so the hub detects it instantly
       try {
-        const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
+        const revoked = JSON.parse(localStorage.getItem('cn_revoked_sessions') || '{}');
         revoked[target.email.toLowerCase()] = Date.now();
-        localStorage.setItem("cn_revoked_sessions", JSON.stringify(revoked));
+        localStorage.setItem('cn_revoked_sessions', JSON.stringify(revoked));
       } catch {}
       updateUsers(users.filter(u => u.id !== id));
     }
   }
 
+  const PROMOTE_PLANS = ['Standard Pro', 'Professional', 'Enterprise'];
+  const maxSubAdmins = settings.currentPlan === 'Enterprise' ? -1 : 1; // -1 = unlimited
+
+  async function handlePromote(user) {
+    setPromoting(user.id); setPromoteErr('');
+    try {
+      const r = await fetch('/auth/promote-user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: user.email, orgAdmin: orgScope, maxSubAdmins }),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        setPromoteErr(d.error || 'Failed to promote');
+      } else {
+        // Optimistic update immediately, then re-sync from DB to confirm it persisted
+        setUsers(prev => prev.map(u => u.id === user.id ? { ...u, role: 'admin' } : u));
+        fetch(`/auth/users?admin=${encodeURIComponent(orgScope)}`)
+          .then(res => res.json())
+          .then(dbUsers => {
+            if (Array.isArray(dbUsers)) {
+              setUsers(dbUsers.map(u => ({
+                id: u.id, name: u.name, email: u.email, role: u.role || 'user',
+                mfaEnabled: u.mfaEnabled, createdAt: u.createdAt, lastLogin: u.lastLogin,
+                tools: Array.isArray(u.tools) ? u.tools : ['monitoring','billing'], photo: u.photo || null,
+              })));
+            }
+          }).catch(() => {});
+      }
+    } catch { setPromoteErr('Network error'); }
+    setPromoting(null);
+  }
+
+  async function handleDemote(user) {
+    setPromoting(user.id); setPromoteErr('');
+    try {
+      const r = await fetch('/auth/demote-user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: user.email, orgAdmin: orgScope }),
+      });
+      const d = await r.json();
+      if (!r.ok) {
+        setPromoteErr(d.error || 'Failed to demote');
+      } else {
+        // Optimistic update immediately, then re-sync from DB to confirm it persisted
+        setUsers(prev => prev.map(u => u.id === user.id ? { ...u, role: 'user' } : u));
+        fetch(`/auth/users?admin=${encodeURIComponent(orgScope)}`)
+          .then(res => res.json())
+          .then(dbUsers => {
+            if (Array.isArray(dbUsers)) {
+              setUsers(dbUsers.map(u => ({
+                id: u.id, name: u.name, email: u.email, role: u.role || 'user',
+                mfaEnabled: u.mfaEnabled, createdAt: u.createdAt, lastLogin: u.lastLogin,
+                tools: Array.isArray(u.tools) ? u.tools : ['monitoring','billing'], photo: u.photo || null,
+              })));
+            }
+          }).catch(() => {});
+      }
+    } catch { setPromoteErr('Network error'); }
+    setPromoting(null);
+  }
+
   function toggleTool(userId, tool) {
     if (!planRestrictions.allowedTools.includes(tool)) return; // blocked by plan
-    updateUsers(users.map(u => {
+    const target = users.find(u => u.id === userId);
+    if (!target) return;
+    const isEnabling = !target.tools.includes(tool);
+    if (isEnabling && planRestrictions.maxToolUsers) {
+      const limit = planRestrictions.maxToolUsers[tool];
+      if (limit != null && users.filter(u => u.tools.includes(tool)).length >= limit) return;
+    }
+    const newUsers = users.map(u => {
       if (u.id !== userId) return u;
       const tools = u.tools.includes(tool) ? u.tools.filter(t => t !== tool) : [...u.tools, tool];
       return { ...u, tools };
-    }));
+    });
+    updateUsers(newUsers);
+    const updated = newUsers.find(u => u.id === userId);
+    if (updated && orgScope) {
+      fetch(`/auth/users/${encodeURIComponent(updated.email)}/tools`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tools: updated.tools, admin: orgScope }),
+      }).catch(() => {});
+    }
   }
 
   /* ── Nav items ── */
   const navItems = [
     { id: "users",    label: "Users",         Icon: UsersIcon },
+    { id: "restore",  label: "Restore Users", Icon: RestoreIcon, badge: deletedUsers.length || null },
     { id: "access",   label: "Manage Access", Icon: AccessIcon },
     { id: "plan",     label: "Manage Plan",   Icon: PlanIcon },
     { id: "account",  label: "Account",       Icon: AccountIcon },
@@ -831,6 +1679,7 @@ export default function AdminPortal({ admin, onLogout }) {
     "tool-monitoring": "Monitoring",
     "tool-billing":    "Billing",
     users:    "Users",
+    restore:  "Restore Users",
     access:   "Manage Access",
     plan:     "Manage Plan",
     account:  "Account",
@@ -840,10 +1689,9 @@ export default function AdminPortal({ admin, onLogout }) {
   /* ── Section renderers ── */
   function renderToolSection(toolKey) {
     const isMonitoring = toolKey === "monitoring";
-    const toolName   = isMonitoring ? "Monitoring" : "Billing";
-    const toolUrl    = isMonitoring ? "http://localhost:3007" : "http://localhost:3008";
-    const toolImg    = isMonitoring ? "/images/card-monitoring.png" : "/images/card-billing.png";
-    const toolDesc   = isMonitoring
+    const toolName    = isMonitoring ? "Monitoring" : "Billing";
+    const toolImg     = isMonitoring ? "/images/card-monitoring.png" : "/images/card-billing.png";
+    const toolDesc    = isMonitoring
       ? "Real-time infrastructure monitoring, live alerts, server health dashboards, and network analytics."
       : "Cloud cost analytics, invoice management, budget forecasting, and spend optimisation.";
     const accentColor = isMonitoring ? "#2563eb" : "#16a34a";
@@ -853,31 +1701,29 @@ export default function AdminPortal({ admin, onLogout }) {
     return (
       <>
         {/* Info row */}
-        <div className="ap-card" style={{marginBottom:20,display:"flex",alignItems:"center",gap:18,padding:"20px 26px"}}>
-          <div style={{width:46,height:46,borderRadius:12,background:bgColor,border:`1.5px solid ${borderColor}`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
-            {isMonitoring
-              ? <MonitoringNavIcon />
-              : <BillingNavIcon />
-            }
+        <div className="ap-card" style={{ marginBottom: 20, display: "flex", alignItems: "center", gap: 18, padding: "20px 26px" }}>
+          <div style={{ width: 46, height: 46, borderRadius: 12, background: bgColor, border: `1.5px solid ${borderColor}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            {isMonitoring ? <MonitoringNavIcon /> : <BillingNavIcon />}
           </div>
-          <div style={{flex:1}}>
-            <div style={{fontSize:15,fontWeight:700,color:"#0f172a",marginBottom:3}}>{toolName}</div>
-            <div style={{fontSize:13,color:"#64748b",lineHeight:1.6}}>{toolDesc}</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: "#0f172a", marginBottom: 3 }}>{toolName}</div>
+            <div style={{ fontSize: 13, color: "#64748b", lineHeight: 1.6 }}>{toolDesc}</div>
           </div>
           <button
             className="ap-btn-primary"
-            style={{background:accentColor,flexShrink:0}}
-            onClick={() => window.open(toolUrl, "_blank")}
+            style={{ background: accentColor, flexShrink: 0, border: "none", cursor: "pointer", fontFamily: "inherit" }}
+            onClick={() => onOpenTool?.(toolKey)}
           >
             Open {toolName} <ArrowRightIcon />
           </button>
         </div>
 
-        {/* Card preview — same as hub */}
+        {/* Card preview — click to open tool fullscreen */}
         <div
           className="ap-tool-launch-card"
-          onClick={() => window.open(toolUrl, "_blank")}
+          onClick={() => onOpenTool?.(toolKey)}
           title={`Open ${toolName}`}
+          style={{ display: "block", cursor: "pointer" }}
         >
           <img src={toolImg} alt={toolName} />
           <div className="ap-tool-launch-fade" />
@@ -893,7 +1739,7 @@ export default function AdminPortal({ admin, onLogout }) {
     const activity   = getActivity(); // fresh read every render (tick forces re-render every 30s)
     const monitoring = users.filter(u => u.tools.includes("monitoring")).length;
     const billing    = users.filter(u => u.tools.includes("billing")).length;
-    const onlineNow  = users.filter(u => isOnline(activity[u.email])).length;
+    const onlineNow  = onlineUsers.filter(o => users.some(u => u.email?.toLowerCase() === o.email?.toLowerCase())).length;
 
     return (
       <>
@@ -907,11 +1753,33 @@ export default function AdminPortal({ admin, onLogout }) {
           <div className="ap-stat-card purple"><div className="ap-stat-val">{billing}</div><div className="ap-stat-label">Billing Access</div></div>
         </div>
 
+        {/* Export bar */}
+        <div style={{display:"flex",alignItems:"center",justifyContent:"flex-end",marginBottom:12}}>
+          <button
+            onClick={() => setExportModal({ target: 'all', dateFrom: '', dateTo: '' })}
+            style={{fontSize:12,fontWeight:600,color:"#fff",background:"linear-gradient(135deg,#1e293b,#334155)",border:"none",cursor:"pointer",padding:"6px 14px",borderRadius:6,fontFamily:"inherit",display:"flex",alignItems:"center",gap:6}}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Export All Logs
+          </button>
+        </div>
+
         <div className="ap-card">
-          {users.length === 0 ? (
+          {usersLoading ? (
+            <div className="ap-empty">
+              <div style={{width:36,height:36,border:"3px solid #e2e8f0",borderTopColor:"#2563eb",borderRadius:"50%",animation:"spin 0.75s linear infinite",margin:"0 auto 14px"}} />
+              <div className="ap-empty-text" style={{color:"#64748b"}}>Loading users…</div>
+            </div>
+          ) : users.length === 0 ? (
             <div className="ap-empty">
               <div className="ap-empty-icon">👥</div>
               <div className="ap-empty-text">No users yet. Create your first user to get started.</div>
+              <button
+                onClick={() => loadUsersFromDB(orgScope)}
+                style={{marginTop:14,padding:"7px 16px",borderRadius:8,border:"1px solid #e2e8f0",background:"#f8fafc",cursor:"pointer",fontSize:12,fontWeight:600,color:"#475569",fontFamily:"inherit"}}
+              >
+                Retry
+              </button>
             </div>
           ) : (
             <table className="ap-table">
@@ -921,18 +1789,19 @@ export default function AdminPortal({ admin, onLogout }) {
               </tr></thead>
               <tbody>
                 {users.map(u => {
-                  const act     = activity[u.email];
-                  const online  = isOnline(act);
-                  const activeDuration = online && act?.sessionStart
-                    ? Date.now() - act.sessionStart : null;
+                  const act        = activity[u.email];
+                  const serverUser = onlineUsers.find(o => o.email?.toLowerCase() === u.email?.toLowerCase());
+                  const online     = !!serverUser;
+                  const activeDuration = online && serverUser?.loginTime
+                    ? Date.now() - serverUser.loginTime : null;
                   const lastDuration = act?.lastSessionDuration || null;
-                  const photo   = getUserPhoto(u.email);
+                  const photo   = u.photo || getUserPhoto(u.email);
                   const isExpanded = expandedUsers.has(u.email);
                   const actData = userActivity[u.email];
 
                   return (
-                    <>
-                    <tr key={u.id} style={{background: isExpanded ? "#f8faff" : undefined}}>
+                    <Fragment key={u.id}>
+                    <tr style={{background: isExpanded ? "#f8faff" : undefined}}>
                       {/* Expand toggle */}
                       <td style={{padding:"14px 8px 14px 16px"}}>
                         <button onClick={() => toggleActivityRow(u.email)} style={{background:"none",border:"none",cursor:"pointer",padding:4,borderRadius:4,color:"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",transition:"transform 0.2s",transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)"}}>
@@ -954,7 +1823,12 @@ export default function AdminPortal({ admin, onLogout }) {
                               : u.name[0].toUpperCase()}
                           </div>
                           <div>
-                            <div style={{fontWeight:700,color:"#0f172a",fontSize:13}}>{u.name}</div>
+                            <div style={{fontWeight:700,color:"#0f172a",fontSize:13,display:"flex",alignItems:"center",gap:4}}>
+                              {u.name}
+                              {onlineUsers.some(o => o.email?.toLowerCase() === u.email?.toLowerCase()) && (
+                                <span style={{display:"inline-block",width:7,height:7,borderRadius:"50%",background:"#22c55e",flexShrink:0}} title="Online now (WebSocket)" />
+                              )}
+                            </div>
                             <div style={{fontSize:11,color:"#94a3b8"}}>{u.email}</div>
                           </div>
                         </div>
@@ -972,13 +1846,8 @@ export default function AdminPortal({ admin, onLogout }) {
 
                       {/* Last Login */}
                       <td>
-                        {act?.lastLogin ? (
-                          <>
-                            <div className="ap-dt">{fmtDateTime(act.lastLogin)}</div>
-                            {act.totalSessions > 0 && (
-                              <div className="ap-dt-sub">{act.totalSessions} session{act.totalSessions !== 1 ? "s" : ""} total</div>
-                            )}
-                          </>
+                        {u.lastLogin ? (
+                          <div className="ap-dt">{fmtDateTime(u.lastLogin)}</div>
                         ) : (
                           <span style={{fontSize:12,color:"#cbd5e1"}}>Never logged in</span>
                         )}
@@ -998,17 +1867,49 @@ export default function AdminPortal({ admin, onLogout }) {
                       {/* Access */}
                       <td>
                         <div className="ap-badge-row">
+                          {u.role === 'admin' && (
+                            <span style={{fontSize:11,fontWeight:700,color:"#a78bfa",background:"#1e1b4b",border:"1px solid #4c1d95",borderRadius:6,padding:"2px 8px",letterSpacing:.5}}>Co-Admin</span>
+                          )}
                           {u.tools.includes("monitoring") && <span className="ap-tool-badge monitoring">Monitoring</span>}
                           {u.tools.includes("billing")    && <span className="ap-tool-badge billing">Billing</span>}
-                          {u.tools.length === 0 && <span style={{fontSize:12,color:"#94a3b8"}}>No access</span>}
+                          {u.tools.length === 0 && u.role !== 'admin' && <span style={{fontSize:12,color:"#94a3b8"}}>No access</span>}
                         </div>
                       </td>
 
                       {/* Actions */}
                       <td>
-                        <button className="ap-btn-danger" onClick={() => deleteUser(u.id)} title="Delete user">
-                          <TrashIcon />
-                        </button>
+                        <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                          {u.role === 'admin' ? (
+                            <button
+                              onClick={() => handleDemote(u)}
+                              disabled={promoting === u.id}
+                              title="Demote back to regular user"
+                              style={{fontSize:11,fontWeight:600,color:"#f59e0b",background:"#1c1005",border:"1px solid #78350f",borderRadius:6,padding:"4px 10px",cursor:"pointer",whiteSpace:"nowrap",opacity:promoting===u.id?0.5:1}}
+                            >
+                              {promoting === u.id ? '…' : 'Demote'}
+                            </button>
+                          ) : PROMOTE_PLANS.includes(settings.currentPlan) && (() => {
+                            const coAdminCount        = users.filter(x => x.role === 'admin').length;
+                            const coAdminLimitReached = maxSubAdmins !== -1 && coAdminCount >= maxSubAdmins;
+                            if (coAdminLimitReached) return null;
+                            return (
+                              <button
+                                onClick={() => handlePromote(u)}
+                                disabled={promoting === u.id}
+                                title="Promote this user to co-admin"
+                                style={{fontSize:11,fontWeight:600,color:"#a78bfa",background:"#13001f",border:"1px solid #4c1d95",borderRadius:6,padding:"4px 10px",cursor:"pointer",whiteSpace:"nowrap",opacity:promoting===u.id?0.5:1}}
+                              >
+                                {promoting === u.id ? '…' : 'Promote as Admin'}
+                              </button>
+                            );
+                          })()}
+                          <button className="ap-btn-danger" onClick={() => deleteUser(u.id)} title="Delete user">
+                            <TrashIcon />
+                          </button>
+                        </div>
+                        {promoteErr && promoting === null && (
+                          <div style={{fontSize:11,color:"#f87171",marginTop:3}}>{promoteErr}</div>
+                        )}
                       </td>
                     </tr>
 
@@ -1019,12 +1920,24 @@ export default function AdminPortal({ admin, onLogout }) {
                           <div style={{fontFamily:"'Courier New',Courier,monospace"}}>
                             {/* Log header bar */}
                             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 20px 10px 52px",background:"#1e293b",borderBottom:"1px solid #334155"}}>
-                              <span style={{fontSize:11,fontWeight:700,color:"#64748b",letterSpacing:"1px",textTransform:"uppercase"}}>
+                              <span style={{fontSize:11,fontWeight:700,color:"#64748b",letterSpacing:"1px",textTransform:"uppercase",display:"flex",alignItems:"center"}}>
                                 activity log &mdash; {u.email}
+                                {wsConnected && <span style={{fontSize:11,color:"#22c55e",fontWeight:600,marginLeft:8}}>&#9679; LIVE</span>}
                               </span>
-                              <div style={{display:"flex",gap:16,alignItems:"center"}}>
+                              <div style={{display:"flex",gap:10,alignItems:"center"}}>
                                 {actData && !actData.loading && (
-                                  <span style={{fontSize:11,color:"#475569"}}>{actData.events.length} event{actData.events.length !== 1 ? "s" : ""}</span>
+                                  <span style={{fontSize:11,color:"#475569"}}>{actData.events.length} events</span>
+                                )}
+                                {actData && !actData.loading && actData.events.length > 0 && (
+                                  <div style={{position:"relative"}}>
+                                    <button
+                                      onClick={() => setExportModal({ target: u, events: actData.events, dateFrom: '', dateTo: '' })}
+                                      style={{fontSize:11,color:"#38bdf8",background:"none",border:"1px solid #1e40af",cursor:"pointer",padding:"2px 10px",borderRadius:4,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5}}
+                                    >
+                                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                                      Download
+                                    </button>
+                                  </div>
                                 )}
                                 <button
                                   onClick={() => { setUserActivity(p => { const n={...p}; delete n[u.email]; return n; }); setTimeout(() => toggleActivityRow(u.email), 10); }}
@@ -1039,47 +1952,31 @@ export default function AdminPortal({ admin, onLogout }) {
                                 <div style={{color:"#475569",fontSize:12,padding:"12px 52px",fontFamily:"inherit"}}>loading...</div>
                               ) : actData.events.length === 0 ? (
                                 <div style={{color:"#475569",fontSize:12,padding:"12px 52px",fontFamily:"inherit"}}>no events recorded — activity appears once the user opens a tool</div>
-                              ) : actData.events.map((ev, i) => {
-                                const d = ev.ts ? new Date(ev.ts) : new Date();
-                                const pad = n => String(n).padStart(2, '0');
-                                const ts = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-
-                                const tagMap = {
-                                  session_start:      { tag: "SESSION",    color: "#38bdf8" },
-                                  tab_viewed:         { tag: "VIEW",       color: "#a78bfa" },
-                                  cloud_connected:    { tag: "CONNECT",    color: "#34d399" },
-                                  cloud_disconnected: { tag: "DISCONNECT", color: "#f87171" },
-                                  report_exported:    { tag: "EXPORT",     color: "#fbbf24" },
-                                  alert_acknowledged: { tag: "ACK",        color: "#4ade80" },
-                                  invoice_viewed:     { tag: "INVOICE",    color: "#67e8f9" },
+                              ) : (() => {
+                                const tagColors = {
+                                  session_start: "#38bdf8", tab_viewed: "#a78bfa", cloud_connected: "#34d399",
+                                  cloud_disconnected: "#f87171", report_exported: "#fbbf24",
+                                  alert_acknowledged: "#4ade80", invoice_viewed: "#67e8f9",
                                 };
-                                const { tag, color } = tagMap[ev.type] || { tag: ev.type.toUpperCase(), color: "#94a3b8" };
-
-                                const det = ev.details || {};
-                                const msg =
-                                  ev.type === "session_start"      ? `user opened ${(det.tool||"tool").toLowerCase()} tool` :
-                                  ev.type === "tab_viewed"         ? `navigated to ${(det.tab||"").toLowerCase()} tab` :
-                                  ev.type === "cloud_connected"    ? `${(det.provider||"").toLowerCase()} account connected${det.accountId ? " ["+det.accountId+"]" : ""}${det.projectId ? " [project:"+det.projectId+"]" : ""}` :
-                                  ev.type === "cloud_disconnected" ? `${(det.provider||"").toLowerCase()} account disconnected` :
-                                  ev.type === "report_exported"    ? `${(det.tool||"").toLowerCase()} report exported${det.providers ? " ("+det.providers+")" : ""}` :
-                                  ev.type === "alert_acknowledged" ? `alert acknowledged${det.name ? ": "+det.name : ""}` :
-                                  ev.type === "invoice_viewed"     ? `invoice viewed${det.invoice ? " "+det.invoice : ""}` :
-                                  JSON.stringify(det);
-
-                                return (
-                                  <div key={i} style={{display:"flex",alignItems:"baseline",gap:0,padding:"3px 20px 3px 52px",fontSize:12,lineHeight:1.6,background: i%2===0 ? "transparent" : "rgba(255,255,255,0.02)"}}>
-                                    <span style={{color:"#94a3b8",flexShrink:0,marginRight:16,letterSpacing:"0.3px"}}>{ts}</span>
-                                    <span style={{color,fontWeight:700,minWidth:86,flexShrink:0,letterSpacing:"0.5px"}}>{tag}</span>
-                                    <span style={{color:"#94a3b8"}}>{msg}</span>
-                                  </div>
-                                );
-                              })}
+                                return actData.events.map((ev, i) => {
+                                  const { ts, tag, path, action } = formatEventLine(ev);
+                                  const color = tagColors[ev.type] || "#94a3b8";
+                                  return (
+                                    <div key={i} style={{display:"flex",alignItems:"baseline",flexWrap:"wrap",gap:0,padding:"4px 20px 4px 52px",fontSize:12,lineHeight:1.6,background: i%2===0 ? "transparent" : "rgba(255,255,255,0.02)"}}>
+                                      <span style={{color:"#475569",flexShrink:0,marginRight:14,letterSpacing:"0.3px",fontVariantNumeric:"tabular-nums"}}>{ts}</span>
+                                      <span style={{color,fontWeight:700,minWidth:80,flexShrink:0,letterSpacing:"0.5px",marginRight:14}}>{tag}</span>
+                                      <span style={{color:"#60a5fa",fontFamily:"ui-monospace,monospace",fontSize:11,marginRight:8,letterSpacing:"0.2px"}}>{path}</span>
+                                      <span style={{color:"#64748b"}}>— {action}</span>
+                                    </div>
+                                  );
+                                });
+                              })()}
                             </div>
                           </div>
                         </td>
                       </tr>
                     )}
-                    </>
+                    </Fragment>
                   );
                 })}
               </tbody>
@@ -1095,6 +1992,20 @@ export default function AdminPortal({ admin, onLogout }) {
     const monAllowed  = allowedTools.includes("monitoring");
     const billAllowed = allowedTools.includes("billing");
 
+    const monLimit   = planRestrictions.maxToolUsers?.monitoring ?? null;
+    const billLimit  = planRestrictions.maxToolUsers?.billing    ?? null;
+    const monCount   = users.filter(u => u.tools.includes("monitoring")).length;
+    const billCount  = users.filter(u => u.tools.includes("billing")).length;
+    const monAtLimit = monLimit !== null && monCount >= monLimit;
+    const billAtLimit = billLimit !== null && billCount >= billLimit;
+
+    const lockedSpan = (
+      <span style={{fontSize:12,color:"#94a3b8",display:"inline-flex",alignItems:"center",gap:5,padding:"5px 10px",border:"1.5px solid #e2e8f0",borderRadius:8,background:"#f8fafc"}}>
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        Not in Plan
+      </span>
+    );
+
     return (
       <div className="ap-card">
         {/* Plan restriction banner */}
@@ -1108,6 +2019,21 @@ export default function AdminPortal({ admin, onLogout }) {
             </span>
           </div>
         )}
+
+        {/* Per-tool limit banner for Professional plan */}
+        {(monLimit !== null || billLimit !== null) && (
+          <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:10,padding:"10px 16px",marginBottom:18,display:"flex",alignItems:"center",gap:10,fontSize:13,color:"#1e40af"}}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2563eb" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+            <span>
+              <strong>{settings.currentPlan}</strong> limits tool access:&nbsp;
+              {monLimit !== null && <><strong>{monLimit}</strong> Monitoring user{monLimit !== 1 ? "s" : ""}</>}
+              {monLimit !== null && billLimit !== null && " · "}
+              {billLimit !== null && <><strong>{billLimit}</strong> Billing user{billLimit !== 1 ? "s" : ""}</>}.
+              &nbsp;Toggle buttons are disabled once a limit is reached.
+            </span>
+          </div>
+        )}
+
         {users.length === 0 ? (
           <div className="ap-empty">
             <div className="ap-empty-icon">🔐</div>
@@ -1118,17 +2044,44 @@ export default function AdminPortal({ admin, onLogout }) {
             <thead><tr>
               <th>User</th><th>Email</th>
               <th>
-                Monitoring
-                {!monAllowed && <span style={{marginLeft:6,fontSize:10,color:"#ef4444",background:"#fee2e2",padding:"1px 6px",borderRadius:4,fontWeight:700}}>LOCKED</span>}
+                <span style={{display:"inline-flex",alignItems:"center",gap:6}}>
+                  Monitoring
+                  {!monAllowed
+                    ? <span style={{fontSize:10,color:"#ef4444",background:"#fee2e2",padding:"1px 6px",borderRadius:4,fontWeight:700}}>LOCKED</span>
+                    : monLimit !== null && (
+                      <span style={{fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:4,
+                        background: monAtLimit ? "#fee2e2" : "#dcfce7",
+                        color:      monAtLimit ? "#dc2626"  : "#15803d"}}>
+                        {monCount}/{monLimit}
+                      </span>
+                    )
+                  }
+                </span>
               </th>
               <th>
-                Billing
-                {!billAllowed && <span style={{marginLeft:6,fontSize:10,color:"#ef4444",background:"#fee2e2",padding:"1px 6px",borderRadius:4,fontWeight:700}}>LOCKED</span>}
+                <span style={{display:"inline-flex",alignItems:"center",gap:6}}>
+                  Billing
+                  {!billAllowed
+                    ? <span style={{fontSize:10,color:"#ef4444",background:"#fee2e2",padding:"1px 6px",borderRadius:4,fontWeight:700}}>LOCKED</span>
+                    : billLimit !== null && (
+                      <span style={{fontSize:10,fontWeight:700,padding:"1px 7px",borderRadius:4,
+                        background: billAtLimit ? "#fee2e2" : "#dcfce7",
+                        color:      billAtLimit ? "#dc2626"  : "#15803d"}}>
+                        {billCount}/{billLimit}
+                      </span>
+                    )
+                  }
+                </span>
               </th>
             </tr></thead>
             <tbody>
               {users.map(u => {
-                const photo = getUserPhoto(u.email);
+                const photo = u.photo || getUserPhoto(u.email);
+                const monEnabled  = u.tools.includes("monitoring");
+                const billEnabled = u.tools.includes("billing");
+                const monDisabled  = monAllowed && !monEnabled  && monAtLimit;
+                const billDisabled = billAllowed && !billEnabled && billAtLimit;
+
                 return (
                 <tr key={u.id}>
                   <td><div className="ap-user-cell">
@@ -1142,27 +2095,29 @@ export default function AdminPortal({ admin, onLogout }) {
                   <td style={{color:"#64748b"}}>{u.email}</td>
                   <td>
                     {monAllowed ? (
-                      <button className={`ap-toggle-btn ${u.tools.includes("monitoring") ? "on" : "off"} monitoring`} onClick={() => toggleTool(u.id, "monitoring")}>
-                        {u.tools.includes("monitoring") ? <><CheckIcon /> Enabled</> : "Disabled"}
+                      <button
+                        className={`ap-toggle-btn ${monEnabled ? "on" : "off"} monitoring`}
+                        onClick={() => toggleTool(u.id, "monitoring")}
+                        disabled={monDisabled}
+                        title={monDisabled ? `Monitoring limit reached (${monLimit}/${monLimit} users)` : undefined}
+                        style={monDisabled ? {opacity:0.4,cursor:"not-allowed",pointerEvents:"none"} : undefined}
+                      >
+                        {monEnabled ? <><CheckIcon /> Enabled</> : "Disabled"}
                       </button>
-                    ) : (
-                      <span style={{fontSize:12,color:"#94a3b8",display:"inline-flex",alignItems:"center",gap:5,padding:"5px 10px",border:"1.5px solid #e2e8f0",borderRadius:8,background:"#f8fafc"}}>
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-                        Not in Plan
-                      </span>
-                    )}
+                    ) : lockedSpan}
                   </td>
                   <td>
                     {billAllowed ? (
-                      <button className={`ap-toggle-btn ${u.tools.includes("billing") ? "on" : "off"} billing`} onClick={() => toggleTool(u.id, "billing")}>
-                        {u.tools.includes("billing") ? <><CheckIcon /> Enabled</> : "Disabled"}
+                      <button
+                        className={`ap-toggle-btn ${billEnabled ? "on" : "off"} billing`}
+                        onClick={() => toggleTool(u.id, "billing")}
+                        disabled={billDisabled}
+                        title={billDisabled ? `Billing limit reached (${billLimit}/${billLimit} users)` : undefined}
+                        style={billDisabled ? {opacity:0.4,cursor:"not-allowed",pointerEvents:"none"} : undefined}
+                      >
+                        {billEnabled ? <><CheckIcon /> Enabled</> : "Disabled"}
                       </button>
-                    ) : (
-                      <span style={{fontSize:12,color:"#94a3b8",display:"inline-flex",alignItems:"center",gap:5,padding:"5px 10px",border:"1.5px solid #e2e8f0",borderRadius:8,background:"#f8fafc"}}>
-                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-                        Not in Plan
-                      </span>
-                    )}
+                    ) : lockedSpan}
                   </td>
                 </tr>
               );
@@ -1179,7 +2134,7 @@ export default function AdminPortal({ admin, onLogout }) {
       "Monitoring Bundle": { userLimit: "2",         modules: 1, desc: "Monitoring module for 1 Admin + 1 User — billed annually per user." },
       "Billing Bundle":    { userLimit: "2",         modules: 1, desc: "Billing module for 1 Admin + 1 User — billed annually per user." },
       "Standard Pro":      { userLimit: "4",         modules: 2, desc: "Full platform access with monitoring & billing for growing teams." },
-      "Professional":      { userLimit: "5",         modules: 2, desc: "Advanced analytics and multi-user access across all platform modules." },
+      "Professional":      { userLimit: "8",         modules: 2, desc: "Up to 8 users — 3 with Monitoring access · 3 with Billing access." },
       "Enterprise":        { userLimit: "Unlimited", modules: 2, desc: "Unlimited scale, custom integrations, and 24/7 priority support." },
     };
     const DEFAULT_META = { userLimit: "∞", modules: 2, desc: "Full platform access with no user cap — ideal for testing and internal rollout." };
@@ -1204,7 +2159,7 @@ export default function AdminPortal({ admin, onLogout }) {
       mon:        ["1 Admin + 1 User", "Monitoring Module Access", "Real-time Alerts & Dashboards", "Server & Network Health", "Email Support"],
       bill:       ["1 Admin + 1 User", "Billing Module Access", "Cost Analytics & Forecasting", "Invoice & Budget Management", "Email Support"],
       standard:   ["2 Admins Included", "Monitoring & Billing Access", "Full Dashboard Suite", "Custom Alert Policies", "Priority Email Support"],
-      pro:        ["2 Admins + 3 Users per Module", "Full Platform Access", "Advanced Analytics & Reports", "Dedicated Account Manager", "API Access & Integrations"],
+      pro:        ["Up to 8 Users Total", "3 Monitoring + 3 Billing Users", "Full Platform Access", "Advanced Analytics & Reports", "API Access & Integrations"],
       enterprise: ["Unlimited Users", "Full Platform Access", "Custom Integrations & SSO", "24/7 Priority Support", "SLA Guarantee"],
     };
 
@@ -1354,15 +2309,26 @@ export default function AdminPortal({ admin, onLogout }) {
                 {activePlan === "Standard Pro" && activeBadge}
                 <div className="pc-name">Standard Pro</div>
                 <div className="pc-price-wrap">
-                  <span className="pc-price pc-contact">Contact Us</span>
+                  <span className="pc-price">₹10,000</span>
+                  <span className="pc-period">per user / year</span>
                 </div>
                 <p className="pc-desc">For growing teams that need full access to both monitoring and billing in one plan.</p>
                 <ul className="pc-features">
                   {planFeatures.standard.map(f => <li key={f}><CheckIcon />{f}</li>)}
                 </ul>
-                {activePlan === "Standard Pro" ? cancelBtn : (
-                  <button className="btn btn-secondary btn-lg pc-btn" onClick={() => window.open("http://localhost:3006/#contact","_blank")}>
-                    Contact Sales
+                {activePlan === "Standard Pro" ? cancelBtn : payState.success && payState.planName === "Standard Pro" ? (
+                  <div style={{marginTop:"auto",background:"#f0fdf4",border:"1px solid #86efac",borderRadius:10,padding:"12px 14px",fontSize:13,color:"#15803d",fontWeight:700}}>
+                    ✓ Payment confirmed!
+                    <div style={{fontSize:11,color:"#16a34a",fontWeight:500,marginTop:3}}>ID: {payState.success}</div>
+                  </div>
+                ) : (
+                  <button
+                    className="btn btn-secondary btn-lg pc-btn"
+                    onClick={() => handleBuyNow("Standard Pro", 1000000)}
+                    disabled={payState.loading}
+                    style={{opacity: payState.loading ? 0.7 : 1}}
+                  >
+                    {payState.loading && payState.planName === "Standard Pro" ? "Opening…" : "Buy Now  ₹10,000"}
                   </button>
                 )}
               </div>
@@ -1372,15 +2338,26 @@ export default function AdminPortal({ admin, onLogout }) {
                 {activePlan === "Professional" ? activeBadge : <div className="pc-badge">Most Popular</div>}
                 <div className="pc-name">Professional</div>
                 <div className="pc-price-wrap">
-                  <span className="pc-price pc-contact">Contact Us</span>
+                  <span className="pc-price">₹10,000</span>
+                  <span className="pc-period">per user / year</span>
                 </div>
                 <p className="pc-desc">Scale your team with multi-user access and advanced analytics across all modules.</p>
                 <ul className="pc-features">
                   {planFeatures.pro.map(f => <li key={f}><CheckIcon />{f}</li>)}
                 </ul>
-                {activePlan === "Professional" ? cancelBtn : (
-                  <button className="btn btn-primary btn-lg pc-btn" onClick={() => window.open("http://localhost:3006/#contact","_blank")}>
-                    Contact Sales
+                {activePlan === "Professional" ? cancelBtn : payState.success && payState.planName === "Professional" ? (
+                  <div style={{marginTop:"auto",background:"#f0fdf4",border:"1px solid #86efac",borderRadius:10,padding:"12px 14px",fontSize:13,color:"#15803d",fontWeight:700}}>
+                    ✓ Payment confirmed!
+                    <div style={{fontSize:11,color:"#16a34a",fontWeight:500,marginTop:3}}>ID: {payState.success}</div>
+                  </div>
+                ) : (
+                  <button
+                    className="btn btn-primary btn-lg pc-btn"
+                    onClick={() => handleBuyNow("Professional", 1000000)}
+                    disabled={payState.loading}
+                    style={{opacity: payState.loading ? 0.7 : 1}}
+                  >
+                    {payState.loading && payState.planName === "Professional" ? "Opening…" : "Buy Now  ₹10,000"}
                   </button>
                 )}
               </div>
@@ -1390,15 +2367,26 @@ export default function AdminPortal({ admin, onLogout }) {
                 {activePlan === "Enterprise" && activeBadge}
                 <div className="pc-name">Enterprise</div>
                 <div className="pc-price-wrap">
-                  <span className="pc-price pc-contact">Contact Us</span>
+                  <span className="pc-price">₹10,000</span>
+                  <span className="pc-period">per user / year</span>
                 </div>
                 <p className="pc-desc">Unlimited scale, custom integrations, and white-glove support for large organizations.</p>
                 <ul className="pc-features">
                   {planFeatures.enterprise.map(f => <li key={f}><CheckIcon />{f}</li>)}
                 </ul>
-                {activePlan === "Enterprise" ? cancelBtn : (
-                  <button className="btn btn-secondary btn-lg pc-btn" onClick={() => window.open("http://localhost:3006/#contact","_blank")}>
-                    Contact Sales
+                {activePlan === "Enterprise" ? cancelBtn : payState.success && payState.planName === "Enterprise" ? (
+                  <div style={{marginTop:"auto",background:"#f0fdf4",border:"1px solid #86efac",borderRadius:10,padding:"12px 14px",fontSize:13,color:"#15803d",fontWeight:700}}>
+                    ✓ Payment confirmed!
+                    <div style={{fontSize:11,color:"#16a34a",fontWeight:500,marginTop:3}}>ID: {payState.success}</div>
+                  </div>
+                ) : (
+                  <button
+                    className="btn btn-secondary btn-lg pc-btn"
+                    onClick={() => handleBuyNow("Enterprise", 1000000)}
+                    disabled={payState.loading}
+                    style={{opacity: payState.loading ? 0.7 : 1}}
+                  >
+                    {payState.loading && payState.planName === "Enterprise" ? "Opening…" : "Buy Now  ₹10,000"}
                   </button>
                 )}
               </div>
@@ -1467,7 +2455,7 @@ export default function AdminPortal({ admin, onLogout }) {
               ) : (
                 <div className="ap-account-name" style={{marginBottom:0}}>{adminProfile.name}</div>
               )}
-              <div className="ap-account-role" style={{marginTop:6}}>Super Admin</div>
+              <div className="ap-account-role" style={{marginTop:6}}>{admin?.orgAdmin ? 'Co-Admin' : 'Super Admin'}</div>
             </div>
           </div>
 
@@ -1555,10 +2543,70 @@ export default function AdminPortal({ admin, onLogout }) {
     );
   }
 
+  function renderRestoreUsers() {
+    if (deletedLoading) {
+      return (
+        <div className="ap-empty">
+          <div style={{width:36,height:36,border:"3px solid #e2e8f0",borderTopColor:"#2563eb",borderRadius:"50%",animation:"spin 0.75s linear infinite",margin:"0 auto 14px"}} />
+          <div className="ap-empty-text" style={{color:"#64748b"}}>Loading deleted users…</div>
+        </div>
+      );
+    }
+    if (deletedUsers.length === 0) {
+      return (
+        <div className="ap-empty">
+          <div className="ap-empty-icon">🗑️</div>
+          <div className="ap-empty-text">No recently deleted users. Deleted users appear here for 7 days.</div>
+          <button onClick={() => loadDeletedUsers(orgScope)}
+            style={{marginTop:14,padding:"7px 16px",borderRadius:8,border:"1px solid #e2e8f0",background:"#f8fafc",cursor:"pointer",fontSize:12,fontWeight:600,color:"#475569",fontFamily:"inherit"}}>
+            Refresh
+          </button>
+        </div>
+      );
+    }
+
+    const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+    return (
+      <div style={{display:"flex",flexDirection:"column",gap:12}}>
+        {deletedUsers.map(u => {
+          const deletedAt = new Date(u.deleted_at).getTime();
+          const expiresAt = deletedAt + SEVEN_DAYS_MS;
+          const remaining = expiresAt - Date.now();
+          const daysLeft  = Math.max(0, Math.ceil(remaining / (24 * 60 * 60 * 1000)));
+          const pct       = Math.max(0, Math.min(100, (remaining / SEVEN_DAYS_MS) * 100));
+          const barColor  = pct > 50 ? "#22c55e" : pct > 25 ? "#f59e0b" : "#dc2626";
+          const initials  = (u.name || u.email || "?").slice(0, 2).toUpperCase();
+          return (
+            <div key={u.email} className="ap-restore-card">
+              <div className="ap-restore-avatar">{initials}</div>
+              <div className="ap-restore-info">
+                <div className="ap-restore-name">{u.name || u.email}</div>
+                <div className="ap-restore-meta">{u.email} · Deleted by {u.deleted_by || "admin"} on {new Date(u.deleted_at).toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})}</div>
+                <div className="ap-restore-countdown">
+                  <div className="ap-restore-bar-bg">
+                    <div className="ap-restore-bar-fill" style={{width:`${pct}%`,background:barColor}} />
+                  </div>
+                  <div className="ap-restore-days" style={{color:barColor}}>
+                    {daysLeft} day{daysLeft !== 1 ? "s" : ""} left to restore
+                  </div>
+                </div>
+              </div>
+              <button className="ap-restore-btn" onClick={() => handleRestoreUser(u)}>
+                Restore
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+
   const sectionMap = {
     "tool-monitoring": () => renderToolSection("monitoring"),
     "tool-billing":    () => renderToolSection("billing"),
     users:    renderUsers,
+    restore:  renderRestoreUsers,
     access:   renderAccess,
     plan:     renderPlan,
     account:  renderAccount,
@@ -1568,6 +2616,21 @@ export default function AdminPortal({ admin, onLogout }) {
   return (
     <>
       <style>{css}</style>
+      {planCancelledBanner && (
+        <div style={{
+          position:"fixed", top:0, left:0, right:0, zIndex:9999,
+          background:"linear-gradient(90deg,#dc2626,#b91c1c)",
+          color:"#fff", padding:"14px 20px",
+          display:"flex", alignItems:"center", justifyContent:"space-between",
+          fontWeight:600, fontSize:14, boxShadow:"0 2px 12px rgba(0,0,0,.4)"
+        }}>
+          <span>Your plan has been cancelled by the super admin. Some features may be restricted.</span>
+          <button onClick={() => setPlanCancelledBanner(false)}
+            style={{background:"none",border:"none",color:"#fff",fontSize:18,cursor:"pointer",padding:"0 4px",lineHeight:1}}>
+            ×
+          </button>
+        </div>
+      )}
       <div className="ap-wrap">
 
         {/* Sidebar */}
@@ -1579,6 +2642,7 @@ export default function AdminPortal({ admin, onLogout }) {
               <button
                 className={`ap-nav-btn tool-monitoring ${section === "tool-monitoring" ? "ap-active" : ""}`}
                 onClick={() => setSection("tool-monitoring")}
+                title="Monitoring"
               >
                 <MonitoringNavIcon />
                 <span className="ap-nav-tip">Monitoring</span>
@@ -1588,6 +2652,7 @@ export default function AdminPortal({ admin, onLogout }) {
               <button
                 className={`ap-nav-btn tool-billing ${section === "tool-billing" ? "ap-active" : ""}`}
                 onClick={() => setSection("tool-billing")}
+                title="Billing"
               >
                 <BillingNavIcon />
                 <span className="ap-nav-tip">Billing</span>
@@ -1599,9 +2664,14 @@ export default function AdminPortal({ admin, onLogout }) {
             )}
 
             {/* ── Admin nav items ── */}
-            {navItems.map(({ id, label, Icon }) => (
-              <button key={id} className={`ap-nav-btn ${section === id ? "ap-active" : ""}`} onClick={() => setSection(id)}>
+            {navItems.map(({ id, label, Icon, badge }) => (
+              <button key={id} className={`ap-nav-btn ${section === id ? "ap-active" : ""}`} onClick={() => setSection(id)} style={{position:"relative"}}>
                 <Icon />
+                {badge ? (
+                  <span style={{position:"absolute",top:6,right:6,width:14,height:14,borderRadius:"50%",background:"#dc2626",color:"#fff",fontSize:9,fontWeight:800,display:"flex",alignItems:"center",justifyContent:"center",lineHeight:1}}>
+                    {badge > 9 ? "9+" : badge}
+                  </span>
+                ) : null}
                 <span className="ap-nav-tip">{label}</span>
               </button>
             ))}
@@ -1629,15 +2699,21 @@ export default function AdminPortal({ admin, onLogout }) {
           </div>
 
           <div className="ap-content">
-            <div className="ap-section-head">
+            {<div className="ap-section-head">
               <div>
                 <div className="ap-section-title">{sectionTitles[section]}</div>
-                {section === "tool-monitoring" && <div className="ap-section-sub">Included in your <strong>{settings.currentPlan || "plan"}</strong> — opens in a new tab.</div>}
-                {section === "tool-billing"    && <div className="ap-section-sub">Included in your <strong>{settings.currentPlan || "plan"}</strong> — opens in a new tab.</div>}
                 {section === "users"  && (
                   <div className="ap-section-sub">
-                    {users.length} / {planRestrictions.maxUsers === Infinity ? "∞" : planRestrictions.maxUsers} users
-                    {" — "}{settings.currentPlan || "Developer plan"}
+                    {usersLoading
+                      ? "Loading…"
+                      : `${users.length} / ${planRestrictions.maxUsers === Infinity ? "∞" : planRestrictions.maxUsers} users`
+                    }
+                    {!usersLoading && ` — ${settings.currentPlan || "Developer plan"}`}
+                  </div>
+                )}
+                {section === "restore" && (
+                  <div className="ap-section-sub">
+                    {deletedUsers.length === 0 ? "No recently deleted users" : `${deletedUsers.length} user${deletedUsers.length !== 1 ? "s" : ""} awaiting restore — permanent deletion after 7 days`}
                   </div>
                 )}
                 {section === "access" && <div className="ap-section-sub">Toggle tool access per user. Changes apply instantly on next login.</div>}
@@ -1656,7 +2732,7 @@ export default function AdminPortal({ admin, onLogout }) {
                   <PlusIcon /> Add User
                 </button>
               )}
-            </div>
+            </div>}
             {/* ── Over-limit warning banner ── */}
             {overLimitSecs !== null && planRestrictions.maxUsers !== Infinity && (
               <div style={{
@@ -1712,6 +2788,64 @@ export default function AdminPortal({ admin, onLogout }) {
             {sectionMap[section]?.()}
           </div>
         </div>
+
+        {/* Export Date Range Modal */}
+        {exportModal && (
+          <div className="ap-modal-overlay" onClick={e => e.target === e.currentTarget && setExportModal(null)}>
+            <div className="ap-modal" style={{maxWidth:420}}>
+              <div className="ap-modal-header">
+                <div className="ap-modal-title">
+                  {exportModal.target === 'all' ? 'Export All Logs' : `Export — ${exportModal.target.name || exportModal.target.email}`}
+                </div>
+                <button className="ap-modal-close" onClick={() => setExportModal(null)}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                </button>
+              </div>
+              <div className="ap-modal-body">
+                <p style={{fontSize:13,color:"#64748b",marginBottom:20}}>Select a date range to filter exported logs. Leave blank to export all events.</p>
+                <div style={{display:"flex",gap:14,marginBottom:24}}>
+                  <div style={{flex:1}}>
+                    <label style={{fontSize:11,fontWeight:700,color:"#64748b",letterSpacing:"0.5px",textTransform:"uppercase",display:"block",marginBottom:6}}>From</label>
+                    <input
+                      type="date"
+                      value={exportModal.dateFrom}
+                      onChange={e => setExportModal(p => ({ ...p, dateFrom: e.target.value, dateTo: p.dateTo && p.dateTo < e.target.value ? e.target.value : p.dateTo }))}
+                      style={{width:"100%",fontSize:13,padding:"8px 10px",borderRadius:8,border:"1px solid #e2e8f0",color:"#0f172a",background:"#fff",outline:"none",boxSizing:"border-box"}}
+                    />
+                  </div>
+                  <div style={{flex:1}}>
+                    <label style={{fontSize:11,fontWeight:700,color:"#64748b",letterSpacing:"0.5px",textTransform:"uppercase",display:"block",marginBottom:6}}>To</label>
+                    <input
+                      type="date"
+                      value={exportModal.dateTo}
+                      min={exportModal.dateFrom}
+                      onChange={e => setExportModal(p => ({ ...p, dateTo: e.target.value }))}
+                      style={{width:"100%",fontSize:13,padding:"8px 10px",borderRadius:8,border:"1px solid #e2e8f0",color:"#0f172a",background:"#fff",outline:"none",boxSizing:"border-box"}}
+                    />
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:12}}>
+                  <button
+                    onClick={() => doExportFromModal('pdf')}
+                    style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:8,padding:"11px 0",borderRadius:9,border:"1px solid #e2e8f0",background:"#f8fafc",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:13,color:"#0f172a",transition:"background 0.15s"}}
+                    onMouseEnter={e=>e.currentTarget.style.background="#f1f5f9"} onMouseLeave={e=>e.currentTarget.style.background="#f8fafc"}
+                  >
+                    <span style={{fontSize:18}}>📄</span>
+                    <div style={{textAlign:"left"}}><div>Download PDF</div><div style={{fontSize:11,fontWeight:400,color:"#94a3b8"}}>Print-ready report</div></div>
+                  </button>
+                  <button
+                    onClick={() => doExportFromModal('csv')}
+                    style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:8,padding:"11px 0",borderRadius:9,border:"1px solid #e2e8f0",background:"#f8fafc",cursor:"pointer",fontFamily:"inherit",fontWeight:600,fontSize:13,color:"#0f172a",transition:"background 0.15s"}}
+                    onMouseEnter={e=>e.currentTarget.style.background="#f1f5f9"} onMouseLeave={e=>e.currentTarget.style.background="#f8fafc"}
+                  >
+                    <span style={{fontSize:18}}>📊</span>
+                    <div style={{textAlign:"left"}}><div>Download CSV</div><div style={{fontSize:11,fontWeight:400,color:"#94a3b8"}}>Spreadsheet / Excel</div></div>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Create User Modal */}
         {showModal && (

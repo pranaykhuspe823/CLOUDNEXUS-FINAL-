@@ -2,7 +2,7 @@ import { useState } from "react";
 import * as OTPAuth from "otpauth";
 import QRCode from "qrcode";
 
-const BACKEND      = "http://localhost:3001";
+const BACKEND      = "";
 const ADMIN_USERS  = "cn_admin_users";
 const SETTINGS_KEY = "cn_settings";
 
@@ -102,19 +102,8 @@ export default function AuthPage({ onLogin, onBack }) {
       return;
     }
 
-    // Admin-created users
-    try {
-      const adminUsers = JSON.parse(localStorage.getItem(ADMIN_USERS) || "[]");
-      const match = adminUsers.find(
-        u => u.email.toLowerCase() === email.toLowerCase() && u.password === password
-      );
-      if (match) {
-        await proceedWithUser({ name: match.name, email: match.email, tools: match.tools });
-        return;
-      }
-    } catch {}
-
-    // Backend fallback
+    // Always try the backend first — it has the authoritative role, isAdmin, and orgAdmin values.
+    // This ensures co-admins and promoted users are routed correctly.
     setLoading(true);
     let success = false;
     try {
@@ -128,12 +117,28 @@ export default function AuthPage({ onLogin, onBack }) {
         setLoading(false);
         await proceedWithUser(data.user);
         success = true;
+      } else {
+        // Backend returned an error (wrong password, deleted user, etc.)
+        const err = await res.json().catch(() => ({}));
+        setLoading(false);
+        showAlert("red", err.error || "Invalid email or password.");
+        return;
       }
-    } catch {}
-
-    if (!success) {
+    } catch {
+      // Backend unreachable — fall back to localStorage (legacy users only)
+      try {
+        const adminUsers = JSON.parse(localStorage.getItem(ADMIN_USERS) || "[]");
+        const match = adminUsers.find(
+          u => u.email.toLowerCase() === email.toLowerCase() && u.password === password
+        );
+        if (match) {
+          setLoading(false);
+          await proceedWithUser({ name: match.name, email: match.email, tools: match.tools });
+          return;
+        }
+      } catch {}
       setLoading(false);
-      showAlert("red", "Invalid email or password.");
+      showAlert("red", "Cannot reach the server. Please try again.");
     }
   }
 

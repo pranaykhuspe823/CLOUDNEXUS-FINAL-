@@ -45,10 +45,11 @@ def init_db():
           id              INTEGER PRIMARY KEY AUTOINCREMENT,
           tool            TEXT NOT NULL,
           provider        TEXT NOT NULL,
+          org_admin       TEXT NOT NULL DEFAULT '',
           credentials_enc TEXT NOT NULL,
           connected_at    TEXT DEFAULT (datetime('now')),
           expires_at      TEXT NOT NULL,
-          UNIQUE(tool, provider)
+          UNIQUE(tool, provider, org_admin)
         );
         """)
 
@@ -101,21 +102,38 @@ def _safe_decrypt(enc: str) -> dict | None:
 
 # ── Cloud Sessions ────────────────────────────────────────────────────────
 
-def save_cloud_session(tool: str, provider: str, creds: dict):
+def save_cloud_session(tool: str, provider: str, org_admin: str, creds: dict):
     enc     = _encrypt(creds)
     expires = (datetime.utcnow() + timedelta(hours=48)).strftime("%Y-%m-%d %H:%M:%S")
+    org     = (org_admin or "").lower().strip()
     with _conn() as db:
         db.execute("""
-          INSERT INTO cloud_sessions (tool, provider, credentials_enc, expires_at)
-          VALUES (?,?,?,?)
-          ON CONFLICT(tool,provider) DO UPDATE SET
+          INSERT INTO cloud_sessions (tool, provider, org_admin, credentials_enc, expires_at)
+          VALUES (?,?,?,?,?)
+          ON CONFLICT(tool,provider,org_admin) DO UPDATE SET
             credentials_enc=excluded.credentials_enc,
             connected_at=datetime('now'),
             expires_at=excluded.expires_at
-        """, (tool, provider, enc, expires))
+        """, (tool, provider, org, enc, expires))
 
 
-def load_cloud_sessions(tool: str) -> list[dict]:
+def load_cloud_sessions(tool: str, org_admin: str) -> list[dict]:
+    org = (org_admin or "").lower().strip()
+    with _conn() as db:
+        rows = db.execute(
+            "SELECT * FROM cloud_sessions WHERE tool=? AND org_admin=? AND expires_at > datetime('now')",
+            (tool, org)
+        ).fetchall()
+    result = []
+    for r in rows:
+        creds = _safe_decrypt(r["credentials_enc"])
+        if creds:
+            result.append({"provider": r["provider"], "org_admin": r["org_admin"],
+                           "credentials": creds, "expires_at": r["expires_at"]})
+    return result
+
+
+def load_all_cloud_sessions(tool: str) -> list[dict]:
     with _conn() as db:
         rows = db.execute(
             "SELECT * FROM cloud_sessions WHERE tool=? AND expires_at > datetime('now')",
@@ -125,14 +143,32 @@ def load_cloud_sessions(tool: str) -> list[dict]:
     for r in rows:
         creds = _safe_decrypt(r["credentials_enc"])
         if creds:
-            result.append({"provider": r["provider"], "credentials": creds,
-                           "expires_at": r["expires_at"]})
+            result.append({"provider": r["provider"], "org_admin": r.get("org_admin", ""),
+                           "credentials": creds, "expires_at": r["expires_at"]})
     return result
 
 
-def delete_cloud_session(tool: str, provider: str):
+def delete_cloud_session(tool: str, provider: str, org_admin: str):
+    org = (org_admin or "").lower().strip()
     with _conn() as db:
-        db.execute("DELETE FROM cloud_sessions WHERE tool=? AND provider=?", (tool, provider))
+        db.execute("DELETE FROM cloud_sessions WHERE tool=? AND provider=? AND org_admin=?",
+                   (tool, provider, org))
+
+
+def get_org_admin_for_user(email: str) -> str:
+    if not email:
+        return ""
+    try:
+        with _conn() as db:
+            row = db.execute(
+                "SELECT org_admin FROM users WHERE LOWER(email)=LOWER(?)",
+                (email.lower().strip(),)
+            ).fetchone()
+            if row is None:
+                return email.lower().strip()
+            return (row["org_admin"] or email).lower().strip()
+    except Exception:
+        return email.lower().strip()
 
 
 # ── Logs ─────────────────────────────────────────────────────────────────

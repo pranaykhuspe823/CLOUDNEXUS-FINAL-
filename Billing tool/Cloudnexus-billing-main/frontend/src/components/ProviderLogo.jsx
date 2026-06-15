@@ -1,9 +1,10 @@
 import React from 'react';
 
+const BASE = import.meta.env.BASE_URL || '/';
 const LOGOS = {
-  aws:   '/logos/aws.svg',
-  gcp:   '/logos/gcp.svg',
-  azure: '/logos/azure.svg',
+  aws:   `${BASE}logos/aws.svg`,
+  gcp:   `${BASE}logos/gcp.svg`,
+  azure: `${BASE}logos/azure.svg`,
 };
 
 const LABELS = {

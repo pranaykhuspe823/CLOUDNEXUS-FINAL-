@@ -5,10 +5,11 @@ import React from 'react';
  * size: pixel size (default 20). wrap: adds a rounded container bg.
  */
 export default function ProviderLogo({ provider, size = 20, wrap = false, style = {} }) {
+  const base = import.meta.env.BASE_URL || '/';
   const logoMap = {
-    aws:   '/logos/aws.svg',
-    gcp:   '/logos/gcp.svg',
-    azure: '/logos/azure.svg',
+    aws:   `${base}logos/aws.svg`,
+    gcp:   `${base}logos/gcp.svg`,
+    azure: `${base}logos/azure.svg`,
   };
   const bgMap = {
     aws:   'rgba(255,153,0,0.12)',

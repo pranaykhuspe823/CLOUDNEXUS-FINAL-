@@ -59,6 +59,19 @@ export default function App() {
   const [backendOnline, setBackendOnline] = useState(false);
   const [sessionRevoked, setSessionRevoked] = useState(false);
   const uidRef = useRef('');
+  const [userName, setUserName] = useState('');
+  const [userPhoto, setUserPhoto] = useState(null);
+
+  const TAB_PATHS = {
+    overview: 'cloudnexus.com/monitoring/overview',
+    aws:      'cloudnexus.com/monitoring/aws',
+    gcp:      'cloudnexus.com/monitoring/gcp',
+    azure:    'cloudnexus.com/monitoring/azure',
+    network:  'cloudnexus.com/monitoring/network',
+    heatmap:  'cloudnexus.com/monitoring/heatmap',
+    alerts:   'cloudnexus.com/monitoring/alerts',
+    ai:       'cloudnexus.com/monitoring/ai',
+  };
 
   function logActivity(type, details) {
     const uid = uidRef.current;
@@ -66,14 +79,20 @@ export default function App() {
     fetch('/api/activity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: uid, type, details: details || {} }) }).catch(() => {});
   }
 
-  // Persist uid from URL and poll session validity — works even if tab was already open before deletion
+  // Persist uid + name from URL, fetch photo
   useEffect(() => {
-    const urlUid = new URLSearchParams(window.location.search).get('uid');
-    if (urlUid) localStorage.setItem('cn_tool_uid', urlUid.toLowerCase().trim());
-    const uid = urlUid || localStorage.getItem('cn_tool_uid');
+    const params = new URLSearchParams(window.location.search);
+    const urlUid  = params.get('uid');
+    const urlName = params.get('name');
+    if (urlUid)  localStorage.setItem('cn_tool_uid',  urlUid.toLowerCase().trim());
+    if (urlName) localStorage.setItem('cn_tool_name', urlName);
+    const uid  = urlUid  || localStorage.getItem('cn_tool_uid');
+    const name = urlName || localStorage.getItem('cn_tool_name') || '';
     if (!uid) return;
     uidRef.current = uid;
-    logActivity('session_start', { tool: 'Monitoring' });
+    setUserName(name);
+    fetch(`/auth/photo/${encodeURIComponent(uid)}`).then(r=>r.json()).then(d=>{ if(d.photo) setUserPhoto(d.photo); }).catch(()=>{});
+    logActivity('session_start', { tool: 'Monitoring', path: 'cloudnexus.com/monitoring' });
     let cancelled = false;
     async function check() {
       try {
@@ -94,7 +113,7 @@ export default function App() {
 
   const { emit } = useSocket({
     onConnect: () => setBackendOnline(true),
-    onDisconnect: () => setBackendOnline(false),
+    onDisconnect: () => {},
     onInitialState: (state) => {
       setBackendOnline(true);
       setRealData({
@@ -137,29 +156,63 @@ export default function App() {
   });
 
   useEffect(() => {
-    fetch('/health').then(r => r.json()).then(() => setBackendOnline(true)).catch(() => setBackendOnline(false));
+    function checkHealth() {
+      fetch('/health').then(r => r.json()).then(() => setBackendOnline(true)).catch(() => {});
+    }
+    checkHealth();
+    const id = setInterval(checkHealth, 5000);
+    return () => clearInterval(id);
   }, []);
 
-  // Log tab navigation
-  const firstTab = useRef(true);
+  // Log tab navigation (including initial)
   useEffect(() => {
-    if (firstTab.current) { firstTab.current = false; return; }
-    logActivity('tab_viewed', { tab: tab.charAt(0).toUpperCase() + tab.slice(1) });
+    logActivity('tab_viewed', { tab: tab.charAt(0).toUpperCase() + tab.slice(1), tool: 'Monitoring', path: TAB_PATHS[tab] || `cloudnexus.com/monitoring/${tab}` });
   }, [tab]);
 
-  // Log cloud connections / disconnections
+  // Bottom-left path indicator — shows cloudnexus.com/monitoring/<tab> on cursor move
+  useEffect(() => {
+    const path = TAB_PATHS[tab] || `cloudnexus.com/monitoring/${tab}`;
+    let bar = document.getElementById('__cn_statusbar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = '__cn_statusbar';
+      bar.style.cssText = [
+        'position:fixed','bottom:0','left:0','z-index:2147483647',
+        'background:rgba(15,23,42,0.88)','backdrop-filter:blur(6px)',
+        'color:#e2e8f0','font-size:12px','font-family:ui-monospace,monospace',
+        'padding:3px 12px 4px 10px','border-top-right-radius:7px',
+        'pointer-events:none','max-width:50vw',
+        'overflow:hidden','text-overflow:ellipsis','white-space:nowrap',
+        'opacity:0','transition:opacity 0.15s ease',
+        'border-top:1px solid rgba(148,163,184,0.15)',
+        'border-right:1px solid rgba(148,163,184,0.15)',
+      ].join(';');
+      document.body.appendChild(bar);
+    }
+    bar.textContent = path;
+    let idleTimer = null;
+    function onMove() {
+      bar.textContent = TAB_PATHS[tab] || `cloudnexus.com/monitoring/${tab}`;
+      bar.style.opacity = '1';
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => { bar.style.opacity = '0'; }, 300);
+    }
+    window.addEventListener('mousemove', onMove, { passive: true });
+    return () => { window.removeEventListener('mousemove', onMove); clearTimeout(idleTimer); };
+  }, [tab]);
+
+  // Log cloud disconnections
   const prevConns = useRef({});
   useEffect(() => {
     const prev = prevConns.current;
-    Object.keys(connections).forEach(p => { if (!prev[p]) logActivity('cloud_connected', { provider: p.toUpperCase() }); });
-    Object.keys(prev).forEach(p => { if (!connections[p]) logActivity('cloud_disconnected', { provider: p.toUpperCase() }); });
+    Object.keys(prev).forEach(p => { if (prev[p]?.connected && !connections[p]?.connected) logActivity('cloud_disconnected', { provider: p.toUpperCase(), path: `cloudnexus.com/monitoring/connections/${p}` }); });
     prevConns.current = { ...connections };
   }, [connections]);
 
   // Log report export
   const prevExport = useRef(false);
   useEffect(() => {
-    if (exportOpen && !prevExport.current) logActivity('report_exported', { tool: 'Monitoring' });
+    if (exportOpen && !prevExport.current) logActivity('report_exported', { tool: 'Monitoring', path: 'cloudnexus.com/monitoring/export' });
     prevExport.current = exportOpen;
   }, [exportOpen]);
 
@@ -219,6 +272,11 @@ export default function App() {
   }
 
   function handleAllConnected(conns) {
+    Object.entries(conns).forEach(([provider, data]) => {
+      if (data.connected && data.credMeta && Object.keys(data.credMeta).length > 0) {
+        logActivity('cloud_connected', { provider: provider.toUpperCase(), credentials: data.credMeta, path: `cloudnexus.com/monitoring/connections/${provider}` });
+      }
+    });
     setConnections(conns);
     if (Object.values(conns).some(c => c.connected)) setMode('real');
     else setMode('mock');
@@ -308,6 +366,8 @@ export default function App() {
         searchQuery={searchQuery} onSearchChange={setSearchQuery}
         filterStatus={filterStatus} onFilterChange={setFilterStatus}
         alertCount={activeAlerts.length}
+        userName={userName} userPhoto={userPhoto}
+        onBack={() => window.history.length > 1 ? window.history.back() : window.close()}
       />
 
       <div className="tabs">

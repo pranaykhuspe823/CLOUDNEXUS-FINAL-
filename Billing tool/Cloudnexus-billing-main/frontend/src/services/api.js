@@ -1,18 +1,39 @@
 import axios from 'axios';
 
-const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// When served under /billing/ (single-tunnel mode), API calls must use /billing/api prefix
+// so the main proxy can forward them correctly to the Node.js /billing/api/* routes.
+// When served directly on port 3008, the billing Vite proxy rewrites /api/* → /billing/api/*.
+function getApiBase() {
+  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/billing')) {
+    return '/billing/api';
+  }
+  return '/api';
+}
 
-const api = axios.create({ baseURL: BASE });
+function getUid() { return localStorage.getItem('cn_tool_uid') || ''; }
 
-export const fetchOverview    = (mode) => api.get(`/api/overview?mode=${mode}`).then(r => r.data);
-export const fetchProvider    = (p, mode) => api.get(`/api/provider/${p}?mode=${mode}`).then(r => r.data);
-export const fetchTrend       = (mode, days=7) => api.get(`/api/trend?mode=${mode}&days=${days}`).then(r => r.data);
-export const fetchForecast    = (mode) => api.get(`/api/forecast?mode=${mode}`).then(r => r.data);
-export const fetchAlerts      = (mode) => api.get(`/api/alerts?mode=${mode}`).then(r => r.data);
-export const exportCSV        = (mode) => { window.open(`${BASE}/api/export/csv?mode=${mode}`, '_blank'); };
-export const exportJSON       = (mode) => { window.open(`${BASE}/api/export/json?mode=${mode}`, '_blank'); };
-export const fetchInvoices     = (provider, mode) => api.get(`/api/invoices/${provider}?mode=${mode}`).then(r => r.data);
-export const fetchMonthlyTrend = (mode) => api.get(`/api/trend/monthly?mode=${mode}`).then(r => r.data);
+function qs(params) {
+  const uid = getUid();
+  const full = uid ? { ...params, uid } : params;
+  return new URLSearchParams(
+    Object.entries(full).filter(([, v]) => v !== undefined && v !== null)
+  ).toString();
+}
 
-export const fetchCostComparison = (mode) => api.get(`/api/cost-comparison?mode=${mode}`).then(r => r.data);
-export const fetchNamedResources = (mode) => api.get(`/api/resources/named?mode=${mode}`).then(r => r.data);
+function makeApi() {
+  return axios.create({ baseURL: '' });
+}
+
+export const fetchOverview    = (mode) => makeApi().get(`${getApiBase()}/overview?${qs({ mode })}`).then(r => r.data);
+export const fetchProvider    = (p, mode) => makeApi().get(`${getApiBase()}/provider/${p}?${qs({ mode })}`).then(r => r.data);
+export const fetchTrend       = (mode, days=7) => makeApi().get(`${getApiBase()}/trend?${qs({ mode, days })}`).then(r => r.data);
+export const fetchForecast    = (mode) => makeApi().get(`${getApiBase()}/forecast?${qs({ mode })}`).then(r => r.data);
+export const fetchAlerts      = (mode) => makeApi().get(`${getApiBase()}/alerts?${qs({ mode })}`).then(r => r.data);
+export const exportCSV        = (mode) => { window.open(`${getApiBase()}/export/csv?${qs({ mode })}`, '_blank'); };
+export const exportJSON       = (mode) => { window.open(`${getApiBase()}/export/json?${qs({ mode })}`, '_blank'); };
+export const fetchInvoices    = (provider, mode) => makeApi().get(`${getApiBase()}/invoices/${provider}?${qs({ mode })}`).then(r => r.data);
+export const fetchMonthlyTrend = (mode) => makeApi().get(`${getApiBase()}/trend/monthly?${qs({ mode })}`).then(r => r.data);
+
+export const fetchCostComparison = (mode) => makeApi().get(`${getApiBase()}/cost-comparison?${qs({ mode })}`).then(r => r.data);
+export const fetchAnalysis       = (mode) => makeApi().get(`${getApiBase()}/analysis?${qs({ mode })}`).then(r => r.data);
+export const fetchNamedResources = (mode) => makeApi().get(`${getApiBase()}/resources/named?${qs({ mode })}`).then(r => r.data);

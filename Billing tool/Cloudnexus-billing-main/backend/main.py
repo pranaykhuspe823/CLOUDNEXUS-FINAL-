@@ -8,9 +8,10 @@ import smtplib
 from dotenv import load_dotenv
 
 load_dotenv()
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from time import time
+import time as _std_time
 from typing import Optional, Dict, Any
 import threading
 
@@ -18,7 +19,7 @@ import threading
 sys.path.insert(0, r"d:\CloudNexus_Website")
 try:
     from cloudnexus_db import init_db, save_cloud_session, load_cloud_sessions, \
-        delete_cloud_session, add_log
+        load_all_cloud_sessions, delete_cloud_session, add_log, get_org_admin_for_user
     init_db()
     _db_available = True
 except Exception as _db_err:
@@ -26,8 +27,10 @@ except Exception as _db_err:
     _db_available = False
     def save_cloud_session(*a, **kw): pass
     def load_cloud_sessions(*a, **kw): return []
+    def load_all_cloud_sessions(*a, **kw): return []
     def delete_cloud_session(*a, **kw): pass
     def add_log(*a, **kw): pass
+    def get_org_admin_for_user(*a, **kw): return ""
 
 try:
     from forecaster import run_forecast
@@ -47,60 +50,83 @@ except ModuleNotFoundError:
 app = FastAPI(title="CloudNexus API v2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-_credentials: Dict[str, Dict] = {}
-_real_data_cache = None
-_real_data_cache_ts = 0.0
+# Per-org credentials: {orgAdmin: {provider: {auth_type, creds, meta}}}
+_org_credentials: Dict[str, Dict[str, Dict]] = {}
+_real_data_cache: Dict[str, tuple] = {}  # orgAdmin → (data, timestamp)
 _real_data_cache_lock = threading.Lock()
 _REAL_DATA_CACHE_TTL = 120.0
 
-# ── Restore sessions from DB on startup (fixes refresh disconnect) ─────────
+
+def _resolve_org(uid: str) -> str:
+    if not uid:
+        return ""
+    try:
+        return get_org_admin_for_user(uid.lower().strip()) or uid.lower().strip()
+    except Exception:
+        return uid.lower().strip()
+
+
+# ── Restore sessions from DB on startup (per-org) ─────────────────────────
 def _restore_sessions():
-    for s in load_cloud_sessions("billing"):
-        provider = s["provider"]
-        creds    = s["credentials"]
-        if creds and provider not in _credentials:
-            _credentials[provider] = {"auth_type": creds.get("auth_type", "iam"), "creds": creds, "meta": {}}
-            print(f"[DB] Restored {provider} session (expires {s['expires_at']})")
+    for s in load_all_cloud_sessions("billing"):
+        org_admin = (s.get("org_admin") or "").strip()
+        provider  = s["provider"]
+        creds     = s["credentials"]
+        if creds:
+            if org_admin not in _org_credentials:
+                _org_credentials[org_admin] = {}
+            if provider not in _org_credentials[org_admin]:
+                _org_credentials[org_admin][provider] = {
+                    "auth_type": creds.get("auth_type", "iam"), "creds": creds, "meta": {}
+                }
+                print(f"[DB] Restored [{org_admin}] {provider} session (expires {s['expires_at']})")
 
 _restore_sessions()
 
 
-def _invalidate_real_cache() -> None:
-    global _real_data_cache, _real_data_cache_ts
-    _real_data_cache = None
-    _real_data_cache_ts = 0.0
+def _invalidate_real_cache(org_admin: str = None) -> None:
+    if org_admin is not None:
+        _real_data_cache.pop(org_admin, None)
+    else:
+        _real_data_cache.clear()
 
 
-def _get_cached_real_data() -> dict:
-    global _real_data_cache, _real_data_cache_ts
-    now = time()
-    if _real_data_cache is not None and now - _real_data_cache_ts < _REAL_DATA_CACHE_TTL:
-        return _real_data_cache
+def _get_cached_real_data(org_admin: str = "") -> dict:
+    now    = time()
+    cached = _real_data_cache.get(org_admin)
+    if cached is not None:
+        data, ts = cached
+        if now - ts < _REAL_DATA_CACHE_TTL:
+            return data
     with _real_data_cache_lock:
-        now = time()
-        if _real_data_cache is not None and now - _real_data_cache_ts < _REAL_DATA_CACHE_TTL:
-            return _real_data_cache
+        cached = _real_data_cache.get(org_admin)
+        if cached is not None:
+            data, ts = cached
+            if now - ts < _REAL_DATA_CACHE_TTL:
+                return data
+        org_creds = _org_credentials.get(org_admin, {})
         try:
-            data = get_real_data(_credentials)
+            data = get_real_data(org_creds)
         except ModuleNotFoundError:
             from .real_data import get_real_data as gr
-            data = gr(_credentials)
-        _real_data_cache = data
-        _real_data_cache_ts = now
+            data = gr(org_creds)
+        _real_data_cache[org_admin] = (data, now)
         return data
 
 
 def _get_smtp_config() -> Optional[Dict[str, Any]]:
-    host = os.getenv("EMAIL_SMTP_HOST", "").strip()
-    if not host:
-        return None
+    host = os.getenv("EMAIL_SMTP_HOST", "smtp.zoho.in").strip()
+    user = os.getenv("EMAIL_SMTP_USER", "support@core5.co.in").strip()
+    password = os.getenv("EMAIL_SMTP_PASS", "JsC6DWiPJ7rv")
+    port = int(os.getenv("EMAIL_SMTP_PORT", "465"))
     return {
         "host": host,
-        "port": int(os.getenv("EMAIL_SMTP_PORT", "587")),
-        "user": os.getenv("EMAIL_SMTP_USER", "").strip(),
-        "password": os.getenv("EMAIL_SMTP_PASS", ""),
-        "from_addr": os.getenv("EMAIL_FROM", os.getenv("EMAIL_SMTP_USER", "")).strip(),
-        "use_tls": os.getenv("EMAIL_SMTP_USE_TLS", "true").strip().lower() not in ("false", "0", "no"),
+        "port": port,
+        "user": user,
+        "password": password,
+        "from_addr": os.getenv("EMAIL_FROM", user).strip(),
+        "use_ssl": port == 465,
+        "use_tls": port != 465 and os.getenv("EMAIL_SMTP_USE_TLS", "true").strip().lower() not in ("false", "0", "no"),
     }
 
 
@@ -121,11 +147,16 @@ def _send_email(to_email: str, subject: str, body_text: str, body_html: str = No
         message.add_alternative(body_html, subtype="html")
 
     try:
-        with smtplib.SMTP(smtp_config["host"], smtp_config["port"], timeout=10) as smtp:
-            if smtp_config["use_tls"]:
-                smtp.starttls()
-            smtp.login(smtp_config["user"], smtp_config["password"])
-            smtp.send_message(message)
+        if smtp_config.get("use_ssl"):
+            with smtplib.SMTP_SSL(smtp_config["host"], smtp_config["port"], timeout=10) as smtp:
+                smtp.login(smtp_config["user"], smtp_config["password"])
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(smtp_config["host"], smtp_config["port"], timeout=10) as smtp:
+                if smtp_config["use_tls"]:
+                    smtp.starttls()
+                smtp.login(smtp_config["user"], smtp_config["password"])
+                smtp.send_message(message)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to send email: {exc}")
 
@@ -482,10 +513,12 @@ class CredentialPayload(BaseModel):
     provider:    str
     auth_type:   str
     credentials: Dict[str, Any]
+    uid:         str = ""
 
 
 @app.post("/api/credentials/connect")
 async def credentials_connect(payload: CredentialPayload):
+    org_admin = _resolve_org(payload.uid)
     provider  = payload.provider.lower()
     auth_type = payload.auth_type
     creds     = payload.credentials
@@ -499,11 +532,12 @@ async def credentials_connect(payload: CredentialPayload):
         else:
             raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
         if result["success"]:
-            _credentials[provider] = {"auth_type": auth_type, "creds": creds, "meta": result}
-            _invalidate_real_cache()
-            # Persist session for 48 hours
-            save_cloud_session("billing", provider, {"auth_type": auth_type, **creds})
-            add_log(None, f"connect_{provider}", "billing", provider, {"auth_type": auth_type})
+            if org_admin not in _org_credentials:
+                _org_credentials[org_admin] = {}
+            _org_credentials[org_admin][provider] = {"auth_type": auth_type, "creds": creds, "meta": result}
+            _invalidate_real_cache(org_admin)
+            save_cloud_session("billing", provider, org_admin, {"auth_type": auth_type, **creds})
+            add_log(payload.uid or None, f"connect_{provider}", "billing", provider, {"auth_type": auth_type})
         return result
     except HTTPException:
         raise
@@ -513,18 +547,23 @@ async def credentials_connect(payload: CredentialPayload):
 
 @app.post("/api/credentials/disconnect")
 async def credentials_disconnect(payload: dict):
-    provider = payload.get("provider", "").lower()
-    _credentials.pop(provider, None)
-    _invalidate_real_cache()
-    delete_cloud_session("billing", provider)
-    add_log(None, f"disconnect_{provider}", "billing", provider, None)
+    uid      = str(payload.get("uid", "") or "")
+    org_admin = _resolve_org(uid)
+    provider = str(payload.get("provider", "") or "").lower()
+    if org_admin in _org_credentials:
+        _org_credentials[org_admin].pop(provider, None)
+    _invalidate_real_cache(org_admin)
+    delete_cloud_session("billing", provider, org_admin)
+    add_log(uid or None, f"disconnect_{provider}", "billing", provider, None)
     return {"success": True}
 
 
 @app.get("/api/credentials/status")
-def credentials_status():
-    return {p: {"connected": p in _credentials,
-                "auth_type": _credentials[p].get("auth_type") if p in _credentials else None}
+def credentials_status(uid: str = ""):
+    org_admin = _resolve_org(uid)
+    org_creds = _org_credentials.get(org_admin, {})
+    return {p: {"connected": p in org_creds,
+                "auth_type": org_creds[p].get("auth_type") if p in org_creds else None}
             for p in ["aws", "gcp", "azure"]}
 
 
@@ -537,7 +576,76 @@ class ReportSendPayload(BaseModel):
     email: str
 
 
-_report_schedule: Dict[str, str] = {}
+_SCHEDULE_FILE = os.path.join(os.path.dirname(__file__), "report_schedules.json")
+
+def _load_schedules() -> Dict[str, str]:
+    try:
+        with open(_SCHEDULE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_schedules(data: Dict[str, str]):
+    try:
+        with open(_SCHEDULE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+_report_schedule: Dict[str, str] = _load_schedules()
+_sent_today: Dict[str, str] = {}  # email -> "YYYY-MM-DD" prevents double-send
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _scheduler_loop():
+    """Background thread: fires billing reports at their scheduled IST times."""
+    while True:
+        _std_time.sleep(30)
+        now = datetime.now(_IST)
+        current_hhmm = now.strftime("%H:%M")
+        today_str = now.strftime("%Y-%m-%d")
+
+        for email, sched_time in list(_report_schedule.items()):
+            if sched_time != current_hhmm or _sent_today.get(email) == today_str:
+                continue
+            _sent_today[email] = today_str  # mark before sending to avoid double-fire
+            try:
+                data    = _get_data("real", email)
+                today   = now
+                ov      = data["overview"]
+                pr      = data["providers"]
+                subject = f"Cloud Infrastructure Cost Report — {today.strftime('%B')} {today.day}, {today.year}"
+                text_body = (
+                    f"Cloud Infrastructure Cost Report\n"
+                    f"{today.strftime('%A, %B')} {today.day}, {today.year}\n\n"
+                    f"SUMMARY\n"
+                    f"  Total Spend MTD:     {_r_usd(ov['total_mtd'])}\n"
+                    f"  Active Services:     {ov['active_services']}\n"
+                    f"  30-Day Forecast:     {_r_usd(ov['forecast_30d'])}\n"
+                    f"  Savings Identified:  {_r_usd(ov['savings_found'])}\n\n"
+                    f"PROVIDER BREAKDOWN\n"
+                    f"  Amazon Web Services: {_r_usd(pr['aws']['mtd'])}  ({pr['aws']['delta_pct']:+.1f}%)\n"
+                    f"  Google Cloud:        {_r_usd(pr['gcp']['mtd'])}  ({pr['gcp']['delta_pct']:+.1f}%)\n"
+                    f"  Microsoft Azure:     {_r_usd(pr['azure']['mtd'])}  ({pr['azure']['delta_pct']:+.1f}%)\n"
+                )
+                html_body = _build_report_html(data)
+                _send_email(email, subject, text_body, html_body)
+                print(f"[Scheduler] Billing report sent to {email} at {current_hhmm} IST")
+            except Exception as exc:
+                print(f"[Scheduler] Failed to send billing report to {email}: {exc}")
+
+
+threading.Thread(target=_scheduler_loop, daemon=True).start()
+
+
+@app.get("/api/report/schedule")
+def get_report_schedule(email: str = ""):
+    if email:
+        key = email.lower().strip()
+        if key in _report_schedule:
+            return {"schedule": {"email": key, "time": _report_schedule[key]}}
+        return {"schedule": None}
+    return {"schedules": [{"email": e, "time": t} for e, t in _report_schedule.items()]}
 
 
 @app.post("/api/report/schedule")
@@ -545,12 +653,14 @@ def save_report_schedule(payload: ReportSchedulePayload):
     if "@" not in payload.email:
         raise HTTPException(status_code=400, detail="Invalid email address")
     _report_schedule[payload.email.lower()] = payload.time
+    _save_schedules(_report_schedule)
     return {"success": True, "scheduled": {"email": payload.email.lower(), "time": payload.time}}
 
 
 @app.delete("/api/report/schedule/{email}")
 def delete_report_schedule(email: str):
     _report_schedule.pop(email.lower(), None)
+    _save_schedules(_report_schedule)
     return {"success": True}
 
 
@@ -559,7 +669,7 @@ def send_report_now(payload: ReportSendPayload):
     if "@" not in payload.email:
         raise HTTPException(status_code=400, detail="Invalid email address")
 
-    data    = _get_data("real")
+    data    = _get_data("real", payload.email)
     today   = datetime.utcnow()
     ov      = data["overview"]
     pr      = data["providers"]
@@ -586,25 +696,26 @@ def send_report_now(payload: ReportSendPayload):
     return {"success": True, "sent_to": payload.email.lower()}
 
 
-def _get_data(mode: str) -> dict:
+def _get_data(mode: str, uid: str = "") -> dict:
     if mode == "mock":
         try:
             return get_mock_data()
         except ModuleNotFoundError:
             from .mock_data import get_mock_data as gm
             return gm()
-    return _get_cached_real_data()
+    org_admin = _resolve_org(uid)
+    return _get_cached_real_data(org_admin)
 
 
 
 @app.get("/api/overview")
-def overview(mode: str = "mock"):
-    return _get_data(mode)["overview"]
+def overview(mode: str = "mock", uid: str = ""):
+    return _get_data(mode, uid)["overview"]
 
 
 @app.get("/api/provider/{provider}")
-def provider_data(provider: str, mode: str = "mock"):
-    data = _get_data(mode)
+def provider_data(provider: str, mode: str = "mock", uid: str = ""):
+    data = _get_data(mode, uid)
     pdata = data["providers"].get(provider)
     if not pdata:
         raise HTTPException(status_code=404, detail=f"Provider {provider} not found")
@@ -612,28 +723,22 @@ def provider_data(provider: str, mode: str = "mock"):
 
 
 @app.get("/api/trend")
-def trend(mode: str = "mock", days: int = 90):
-    return _get_data(mode)["trend"][-days:]
+def trend(mode: str = "mock", days: int = 90, uid: str = ""):
+    return _get_data(mode, uid)["trend"][-days:]
 
 
 @app.get("/api/analysis")
-def analysis(mode: str = "real"):
-    # mode supports "mock" but existing UI sends "real" only.
+def analysis(mode: str = "real", uid: str = ""):
+    org_admin  = _resolve_org(uid)
+    org_creds  = _org_credentials.get(org_admin, {})
     try:
         if mode == "mock":
-            try:
-                from mock_data import get_mock_data  # noqa: F401
-            except ModuleNotFoundError:
-                from .mock_data import get_mock_data  # noqa: F401
             payload = analyze_cross_cloud({})
-
             payload["source"] = "mock"
             return payload
-        payload = analyze_cross_cloud(_credentials)
-        # If no live credentials, function already uses mock_data.
+        payload = analyze_cross_cloud(org_creds)
         return payload
     except Exception as e:
-        # Never break UI
         payload = analyze_cross_cloud({})
         payload["source"] = "mock"
         payload["error"] = str(e)
@@ -641,13 +746,12 @@ def analysis(mode: str = "real"):
 
 
 @app.get("/api/forecast")
-
-def forecast(mode: str = "mock"):
+def forecast(mode: str = "mock", uid: str = ""):
     """
     Run ensemble forecast (Holt-Winters + LSTM + XGBoost + Claude AI) over
     the actual trend history — mock or live.  No hardcoded forecast values.
     """
-    data    = _get_data(mode)
+    data    = _get_data(mode, uid)
     history = [d["total"] for d in data["trend"]]
     if not history:
         raise HTTPException(status_code=422, detail="No trend data available for forecasting")
@@ -676,13 +780,13 @@ def forecast(mode: str = "mock"):
 
 
 @app.get("/api/alerts")
-def alerts(mode: str = "mock"):
-    return _get_data(mode)["alerts"]
+def alerts(mode: str = "mock", uid: str = ""):
+    return _get_data(mode, uid)["alerts"]
 
 
 @app.get("/api/export/csv")
-def export_csv(mode: str = "mock"):
-    data   = _get_data(mode)
+def export_csv(mode: str = "mock", uid: str = ""):
+    data   = _get_data(mode, uid)
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Provider", "Service", "Cost", "Percentage", "Status"])
@@ -697,8 +801,8 @@ def export_csv(mode: str = "mock"):
 
 
 @app.get("/api/export/json")
-def export_json(mode: str = "mock"):
-    data    = _get_data(mode)
+def export_json(mode: str = "mock", uid: str = ""):
+    data    = _get_data(mode, uid)
     content = json.dumps(data, indent=2, default=str)
     return StreamingResponse(
         io.BytesIO(content.encode()),
@@ -709,19 +813,21 @@ def export_json(mode: str = "mock"):
 # ── INVOICES ──────────────────────────────────────────────────────────
 
 @app.get("/api/invoices/{provider}")
-def get_invoices(provider: str, mode: str = "mock"):
+def get_invoices(provider: str, mode: str = "mock", uid: str = ""):
     from real_data import get_real_invoices
-    provider = provider.lower()
+    org_admin = _resolve_org(uid)
+    org_creds = _org_credentials.get(org_admin, {})
+    provider  = provider.lower()
     if provider not in ["aws", "gcp", "azure"]:
         raise HTTPException(status_code=400, detail="Invalid provider")
 
-    if mode == "real" and _credentials:
-        live = get_real_invoices(provider, _credentials)
+    if mode == "real" and org_creds:
+        live = get_real_invoices(provider, org_creds)
         if live:
             return {"source": "live", "invoices": live}
 
     # Fallback: derive mock invoices from live trend data (no hardcoded amounts)
-    data  = _get_data(mode)
+    data  = _get_data(mode, uid)
     pdata = data["providers"].get(provider, {})
     mtd   = pdata.get("mtd", 0)
     svcs  = pdata.get("services", [])
@@ -773,9 +879,11 @@ def get_invoices(provider: str, mode: str = "mock"):
 # ── MONTHLY TREND ──────────────────────────────────────────────────────
 
 @app.get("/api/trend/monthly")
-def monthly_trend(mode: str = "mock"):
-    if mode == "real" and _credentials:
-        data = _get_data(mode)
+def monthly_trend(mode: str = "mock", uid: str = ""):
+    org_admin = _resolve_org(uid)
+    org_creds = _org_credentials.get(org_admin, {})
+    if mode == "real" and org_creds:
+        data = _get_data(mode, uid)
         trend = data.get("trend", [])
         months: dict = {}
         for d in trend:
@@ -792,7 +900,7 @@ def monthly_trend(mode: str = "mock"):
         return {"source": "live", "months": list(months.values())}
 
     # Derive from actual trend data — group by month
-    data  = _get_data(mode)
+    data  = _get_data(mode, uid)
     trend = data["trend"]
     months: dict = {}
     for d in trend:
@@ -813,7 +921,7 @@ def monthly_trend(mode: str = "mock"):
 # ── COST COMPARISON (Multi-Cloud FinOps) ──────────────────────────────
 
 @app.get("/api/cost-comparison")
-def cost_comparison(mode: str = "mock"):
+def cost_comparison(mode: str = "mock", uid: str = ""):
     """
     Multi-cloud cost comparison payload: provider stats, radar, monthly history,
     budget analysis, savings recommendations, and cross-service table.
@@ -824,7 +932,9 @@ def cost_comparison(mode: str = "mock"):
     except ModuleNotFoundError:
         from .cost_comparison import build_comparison_payload
 
-    data = _get_data(mode)
+    org_admin  = _resolve_org(uid)
+    org_creds  = _org_credentials.get(org_admin, {})
+    data       = _get_data(mode, uid)
     providers_raw = data.get("providers", {})
 
     # Normalise provider info for the comparison builder
@@ -836,15 +946,14 @@ def cost_comparison(mode: str = "mock"):
             "delta_pct":  block.get("delta_pct", 0),
             "share":      data.get("overview", {}).get("providers", {}).get(p, {}).get("share", 0),
             "services":   block.get("services", []),
-            "connected":  (p in _credentials),
-            "real_data":  (p in _credentials),
+            "connected":  (p in org_creds),
+            "real_data":  (p in org_creds),
         }
 
     # Pull live budgets from credentials meta if available
     budgets = None
     for p in ("aws", "gcp", "azure"):
-        if p in _credentials and isinstance(_credentials[p].get("meta"), dict):
-            # budget info not stored yet; leave as None for defaults
+        if p in org_creds and isinstance(org_creds[p].get("meta"), dict):
             pass
 
     # Compute monthly rollup from actual trend data (real when providers are connected)
@@ -871,14 +980,16 @@ def cost_comparison(mode: str = "mock"):
 # ── ALL RESOURCES — full inventory from every connected provider ────────
 
 @app.get("/api/all-resources")
-def all_resources_endpoint(mode: str = "mock"):
+def all_resources_endpoint(mode: str = "mock", uid: str = ""):
     """
     Returns every provisioned resource (EC2, RDS, S3, Lambda, EKS, ECS,
     Azure VMs, Storage Accounts, GCP Compute) with type, state, region.
     Real mode uses live cloud APIs; mock mode derives from billing services.
     """
-    if mode == "real" and _credentials:
-        data = _get_cached_real_data()
+    org_admin = _resolve_org(uid)
+    org_creds = _org_credentials.get(org_admin, {})
+    if mode == "real" and org_creds:
+        data = _get_cached_real_data(org_admin)
         merged = []
         for p in ("aws", "gcp", "azure"):
             pdata = data.get("providers", {}).get(p, {})
@@ -908,7 +1019,7 @@ def all_resources_endpoint(mode: str = "mock"):
 # ── NAMED RESOURCES — real user-defined names + specs ─────────────────
 
 @app.get("/api/resources/named")
-def named_resources(mode: str = "real"):
+def named_resources(mode: str = "real", uid: str = ""):
     """
     Return all resources with user-defined names and full specs
     from every connected cloud provider.
@@ -918,8 +1029,10 @@ def named_resources(mode: str = "real"):
     except ModuleNotFoundError:
         from .real_data import get_named_resources
 
-    if mode == "real" and _credentials:
-        resources = get_named_resources(_credentials)
+    org_admin = _resolve_org(uid)
+    org_creds = _org_credentials.get(org_admin, {})
+    if mode == "real" and org_creds:
+        resources = get_named_resources(org_creds)
         if resources:
             return {"source": "live", "resources": resources}
 

@@ -1,19 +1,20 @@
 // src/utils/theme.js
 
+const _base = import.meta.env.BASE_URL || '/';
 export const PROVIDER_META = {
   aws: {
     label: 'AWS', full: 'Amazon Web Services', emoji: '🟠',
-    logo: '/logos/aws.svg',
+    logo: `${_base}logos/aws.svg`,
     color: '#FF9900', bg: 'rgba(255,153,0,0.12)',
   },
   gcp: {
     label: 'GCP', full: 'Google Cloud Platform', emoji: '🔵',
-    logo: '/logos/gcp.svg',
+    logo: `${_base}logos/gcp.svg`,
     color: '#4285F4', bg: 'rgba(66,133,244,0.12)',
   },
   azure: {
     label: 'Azure', full: 'Microsoft Azure', emoji: '🔷',
-    logo: '/logos/azure.svg',
+    logo: `${_base}logos/azure.svg`,
     color: '#008AD7', bg: 'rgba(0,138,215,0.12)',
   },
 };

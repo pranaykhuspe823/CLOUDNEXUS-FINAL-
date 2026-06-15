@@ -1,7 +1,25 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { io as socketIO } from "socket.io-client";
 import Landing from "./components/Landing.jsx";
 import AuthPage from "./components/AuthPage.jsx";
 import AdminPortal from "./components/AdminPortal.jsx";
+import SuperAdminPortal from "./components/SuperAdminPortal.jsx";
+import PricingPage from "./components/PricingPage.jsx";
+
+/* ── Tunnel URL support (Cloudflare share mode) ────────────────────
+   When share.ps1 is used, the main tunnel URL includes ?_murl=...
+   &_burl=... params. We read them once on load and store in
+   sessionStorage so they survive in-app navigation. Falls back to
+   localhost for normal local development. */
+{
+  const _p = new URLSearchParams(window.location.search);
+  const _m = _p.get('_murl');
+  const _b = _p.get('_burl');
+  if (_m) sessionStorage.setItem('cn_murl', _m);
+  if (_b) sessionStorage.setItem('cn_burl', _b);
+}
+const MONITORING_BASE = sessionStorage.getItem('cn_murl') || '/monitor/';
+const BILLING_BASE    = sessionStorage.getItem('cn_burl') || '/billing/';
 
 /* ── Activity tracking (shared localStorage key with AdminPortal) ── */
 const ACTIVITY_KEY = "cn_user_activity";
@@ -39,6 +57,25 @@ function recordLogout(email, sessionStart) {
 function updateLastSeen(email) {
   const data = _readActivity();
   if (data[email]) { data[email].lastSeen = Date.now(); _writeActivity(data); }
+}
+
+function RevokedOverlay({ onBack }) {
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(7,17,31,0.93)',backdropFilter:'blur(6px)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',padding:24}}>
+      <div style={{background:'#fff',borderRadius:20,padding:'40px 36px',maxWidth:420,width:'100%',textAlign:'center',boxShadow:'0 24px 64px rgba(0,0,0,0.3)'}}>
+        <div style={{width:60,height:60,background:'#fee2e2',borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 20px'}}>
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        </div>
+        <div style={{fontSize:20,fontWeight:800,color:'#0f172a',marginBottom:10,letterSpacing:'-0.4px'}}>Account Removed</div>
+        <div style={{fontSize:14,color:'#64748b',lineHeight:1.6,marginBottom:28}}>
+          Your account has been removed by the administrator.<br />You no longer have access to CloudNexus.
+        </div>
+        <button onClick={onBack} style={{display:'inline-block',background:'#2563eb',color:'#fff',fontSize:14,fontWeight:700,padding:'12px 32px',borderRadius:10,border:'none',cursor:'pointer',fontFamily:'inherit'}}>
+          Back to Login
+        </button>
+      </div>
+    </div>
+  );
 }
 
 const CloudIcon = () => (
@@ -119,11 +156,76 @@ const hubCss = `
 
 const USER_PHOTO_KEY = (email) => `cn_user_photo_${email}`;
 
+const PAGE_PATHS = {
+  home:              "/",
+  auth:              "/login",
+  pricing:           "/pricing",
+  hub:               "/hub",
+  admin:             "/admin",
+  monitoring:        "/monitoring",
+  billing:           "/billing",
+  "admin-monitoring": "/admin/monitoring",
+  "admin-billing":    "/admin/billing",
+  superadmin:        "/superadmin",
+};
+const PATH_PAGES = Object.fromEntries(Object.entries(PAGE_PATHS).map(([k,v]) => [v, k]));
+
+function navigate(setPage) {
+  return (pg) => {
+    window.scrollTo({ top: 0, behavior: "instant" });
+    const path = PAGE_PATHS[pg] ?? `/${pg}`;
+    window.history.pushState({ page: pg }, "", path);
+    setPage(pg);
+  };
+}
+
 export default function App() {
-  const [page, setPage] = useState("home");
+  const [_page, _setPage] = useState("home");
+  const setPage = navigate(_setPage);
+  const page = _page;
   const [user, setUser] = useState(null);
   const [userPhoto, setUserPhoto] = useState(null);
   const [sessionRevoked, setSessionRevoked] = useState(false);
+
+  const socketRef = useRef(null);
+
+  // Connect socket once on mount
+  useEffect(() => {
+    const socket = socketIO(window.location.origin, { transports: ['websocket', 'polling'] });
+    socketRef.current = socket;
+    return () => { socket.disconnect(); socketRef.current = null; };
+  }, []);
+
+  // Listen for session revocation via WebSocket (instant — replaces most of the polling)
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || !user?.email) return;
+    const myEmail = user.email.toLowerCase();
+    function onRevoked({ email: revokedEmail }) {
+      if (revokedEmail && revokedEmail.toLowerCase() === myEmail) setSessionRevoked(true);
+    }
+    socket.on('session:revoked', onRevoked);
+    return () => socket.off('session:revoked', onRevoked);
+  }, [user?.email]); // eslint-disable-line
+
+  // Real-time tool access updates — when admin changes plan, hub cards update instantly
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || !user?.email) return;
+    const myEmail = user.email.toLowerCase();
+    function onToolsUpdated({ email: updatedEmail, tools }) {
+      if (updatedEmail?.toLowerCase() === myEmail && Array.isArray(tools)) {
+        setUser(prev => {
+          if (!prev) return prev;
+          const updated = { ...prev, tools };
+          localStorage.setItem('cn_user', JSON.stringify(updated));
+          return updated;
+        });
+      }
+    }
+    socket.on('tools:updated', onToolsUpdated);
+    return () => socket.off('tools:updated', onToolsUpdated);
+  }, [user?.email]); // eslint-disable-line
 
   const SESSION_TTL = 2 * 24 * 60 * 60 * 1000;
 
@@ -132,7 +234,9 @@ export default function App() {
       const s = JSON.parse(localStorage.getItem("cn_user"));
       if (s && s.loginTime && (Date.now() - s.loginTime) < SESSION_TTL) {
         setUser(s);
-        setUserPhoto(localStorage.getItem(USER_PHOTO_KEY(s.email)) || null);
+        const savedPhoto = localStorage.getItem(USER_PHOTO_KEY(s.email)) || null;
+        setUserPhoto(savedPhoto);
+        fetch(`/auth/photo/${encodeURIComponent(s.email)}`).then(r=>r.json()).then(d=>{ if(d.photo){ localStorage.setItem(USER_PHOTO_KEY(s.email), d.photo); setUserPhoto(d.photo); } }).catch(()=>{});
         setPage(s.isAdmin ? "admin" : "hub");
       } else {
         localStorage.removeItem("cn_user");
@@ -140,18 +244,98 @@ export default function App() {
     } catch {}
   }, []);
 
+  function _compressPhoto(dataUrl) {
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = () => {
+        const MAX = 256;
+        const scale = Math.min(MAX / Math.max(img.width, img.height), 1);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = Object.assign(document.createElement('canvas'), { width: w, height: h });
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/jpeg', 0.85));
+      };
+      img.onerror = () => resolve(dataUrl);
+      img.src = dataUrl;
+    });
+  }
+
   function handlePhotoUpload(e) {
     const file = e.target.files[0];
     if (!file || !user?.email) return;
     const reader = new FileReader();
-    reader.onload = (ev) => {
-      const dataUrl = ev.target.result;
-      localStorage.setItem(USER_PHOTO_KEY(user.email), dataUrl);
-      setUserPhoto(dataUrl);
+    reader.onload = async (ev) => {
+      const compressed = await _compressPhoto(ev.target.result);
+      try { localStorage.setItem(USER_PHOTO_KEY(user.email), compressed); } catch {}
+      setUserPhoto(compressed);
+      fetch('/auth/photo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: user.email, photo: compressed }),
+      }).catch(() => {});
     };
     reader.readAsDataURL(file);
     e.target.value = "";
   }
+
+  // Sync page state with browser back/forward
+  useEffect(() => {
+    function onPop(e) {
+      const pg = e.state?.page ?? PATH_PAGES[window.location.pathname] ?? "home";
+      _setPage(pg);
+    }
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  // Ctrl+Shift+K → Core5 super admin portal
+  useEffect(() => {
+    function onKey(e) {
+      if (e.ctrlKey && e.shiftKey && e.key === "K") { e.preventDefault(); setPage("superadmin"); }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Bottom-left path indicator (browser-style status bar)
+  useEffect(() => {
+    let bar = document.getElementById("__cn_statusbar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "__cn_statusbar";
+      bar.style.cssText = [
+        "position:fixed", "bottom:0", "left:0", "z-index:2147483647",
+        "background:rgba(15,23,42,0.88)", "backdrop-filter:blur(6px)",
+        "color:#e2e8f0", "font-size:12px", "font-family:ui-monospace,monospace",
+        "padding:3px 12px 4px 10px", "border-top-right-radius:7px",
+        "pointer-events:none", "max-width:50vw",
+        "overflow:hidden", "text-overflow:ellipsis", "white-space:nowrap",
+        "opacity:0", "transition:opacity 0.15s ease",
+        "border-top:1px solid rgba(148,163,184,0.15)",
+        "border-right:1px solid rgba(148,163,184,0.15)",
+      ].join(";");
+      document.body.appendChild(bar);
+    }
+
+    // Always show the real browser URL (updated by pushState above)
+    bar.textContent = "cloudnexus.com" + window.location.pathname;
+
+    // Appear on move, disappear when cursor stops
+    let idleTimer = null;
+    function onMove() {
+      bar.textContent = "cloudnexus.com" + window.location.pathname;
+      bar.style.opacity = "1";
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => { bar.style.opacity = "0"; }, 300);
+    }
+
+    window.addEventListener("mousemove", onMove, { passive: true });
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      clearTimeout(idleTimer);
+    };
+  }, [page]);
 
   // Heartbeat: update lastSeen every 30 s while user is in the hub
   useEffect(() => {
@@ -163,28 +347,28 @@ export default function App() {
 
   // Poll for session revocation every 3 s while user is in the hub or using a tool
   useEffect(() => {
-    if (!["hub", "monitoring", "billing"].includes(page) || !user?.email) return;
+    if (!["hub", "monitoring", "billing", "admin-monitoring", "admin-billing"].includes(page) || !user?.email) return;
     const email = user.email.toLowerCase();
 
+    const loginTime = user?.loginTime || 0;
+
     function checkLocal() {
-      // 1) Explicit revocation list
+      // Only honour a revocation that happened AFTER the user's current login.
+      // This prevents stale revocations (from prior deletions) from blocking
+      // a re-created user who has since logged in successfully.
       try {
         const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
-        if (revoked[email]) { setSessionRevoked(true); return; }
-      } catch {}
-      // 2) Account no longer in user list (admin deleted) — most direct check
-      try {
-        const list = JSON.parse(localStorage.getItem("cn_admin_users") || "[]");
-        if (list.length > 0 && !list.find(u => u.email && u.email.toLowerCase() === email)) {
-          setSessionRevoked(true);
-        }
+        const revokedAt = revoked[email];
+        if (revokedAt && revokedAt > loginTime) setSessionRevoked(true);
       } catch {}
     }
 
     async function checkBackend() {
       try {
-        const res = await fetch(`http://localhost:3001/api/session-check?email=${encodeURIComponent(email)}`);
+        const res = await fetch(`/api/session-check?email=${encodeURIComponent(email)}`);
         const data = await res.json();
+        // Only treat as revoked if the backend says invalid AND we have no loginTime
+        // override — the DB-aware endpoint handles re-created users correctly.
         if (!data.valid) setSessionRevoked(true);
       } catch {}
     }
@@ -194,31 +378,113 @@ export default function App() {
     const id = setInterval(check, 3000);
     // React instantly when another tab changes either key
     function onStorage(e) {
-      if (e.key === "cn_revoked_sessions" || e.key === "cn_admin_users") checkLocal();
+      if (e.key === "cn_revoked_sessions") checkLocal();
     }
     window.addEventListener("storage", onStorage);
     return () => { clearInterval(id); window.removeEventListener("storage", onStorage); };
   }, [page, user?.email]); // eslint-disable-line
 
+  function handleRevokedRelogin() {
+    try {
+      const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
+      delete revoked[user?.email?.toLowerCase()];
+      localStorage.setItem("cn_revoked_sessions", JSON.stringify(revoked));
+    } catch {}
+    localStorage.removeItem("cn_user");
+    setSessionRevoked(false);
+    setUser(null);
+    setPage("auth");
+  }
+
   function handleLogin(userData) {
+    // Clear any stale revocation for this email so a re-created user isn't locked out
+    try {
+      const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
+      delete revoked[userData.email.toLowerCase()];
+      localStorage.setItem("cn_revoked_sessions", JSON.stringify(revoked));
+    } catch {}
+    setSessionRevoked(false);
     const sessionData = { ...userData, loginTime: Date.now() };
     localStorage.setItem("cn_user", JSON.stringify(sessionData));
     setUser(sessionData);
-    setUserPhoto(localStorage.getItem(USER_PHOTO_KEY(userData.email)) || null);
+    const cachedPhoto = localStorage.getItem(USER_PHOTO_KEY(userData.email)) || null;
+    setUserPhoto(cachedPhoto);
+    fetch(`/auth/photo/${encodeURIComponent(userData.email)}`).then(r=>r.json()).then(d=>{ if(d.photo){ localStorage.setItem(USER_PHOTO_KEY(userData.email), d.photo); setUserPhoto(d.photo); } }).catch(()=>{});
     if (!userData.isAdmin) recordLogin(userData.email);
     setPage(userData.isAdmin ? "admin" : "hub");
+    socketRef.current?.emit('user:online', { email: userData.email, name: userData.name });
   }
 
   function logout() {
+    socketRef.current?.emit('user:offline', { email: user?.email });
     if (user && !user.isAdmin) recordLogout(user.email, user.loginTime);
     localStorage.removeItem("cn_user");
     setUser(null);
     setPage("home");
   }
 
+  /* ── SUPER ADMIN (Core5) ── */
+  if (page === "superadmin") {
+    return <SuperAdminPortal onBack={() => setPage("home")} />;
+  }
+
   /* ── ADMIN PORTAL ── */
   if (page === "admin" && user?.isAdmin) {
-    return <AdminPortal admin={user} onLogout={logout} />;
+    return <AdminPortal admin={user} onLogout={logout} onOpenTool={(tool) => setPage(`admin-${tool}`)} onPhotoChange={setUserPhoto} />;
+  }
+
+  /* ── ADMIN TOOL PAGES ── */
+  if ((page === "admin-monitoring" || page === "admin-billing") && user?.isAdmin) {
+    const tool       = page === "admin-monitoring" ? "monitoring" : "billing";
+    const toolLabel  = tool === "monitoring" ? "Monitoring" : "Billing";
+    const toolUrl    = tool === "monitoring"
+      ? `${MONITORING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`
+      : `${BILLING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`;
+    return (
+      <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column" }}>
+        <div style={{ height: 52, background: "#0f172a", display: "flex", alignItems: "center", padding: "0 20px", gap: 16, flexShrink: 0, borderBottom: "1px solid #1e293b" }}>
+          <button
+            onClick={() => setPage("admin")}
+            style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: "1px solid #334155", color: "#94a3b8", padding: "6px 14px", borderRadius: 8, cursor: "pointer", fontSize: 13, fontWeight: 500, whiteSpace: "nowrap", fontFamily: "inherit" }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+            Back to Admin Portal
+          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 28, height: 28, background: "#2563eb", borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
+            </div>
+            <span style={{ color: "#fff", fontWeight: 700, fontSize: 15, letterSpacing: "-0.01em" }}>Cloud<span style={{ color: "#60a5fa" }}>Nexus</span></span>
+          </div>
+          <span style={{ color: "#334155", fontSize: 16 }}>|</span>
+          <span style={{ color: "#e2e8f0", fontSize: 13, fontWeight: 500 }}>{toolLabel}</span>
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 32, height: 32, borderRadius: "50%", overflow: "hidden", background: "#1e293b", border: "2px solid #334155", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              {userPhoto
+                ? <img src={userPhoto} alt="avatar" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+              }
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", lineHeight: 1.2 }}>
+              <span style={{ color: "#f1f5f9", fontSize: 13, fontWeight: 600 }}>{user.name}</span>
+              <span style={{ color: "#64748b", fontSize: 11 }}>{user.email}</span>
+            </div>
+            <button
+              onClick={logout}
+              style={{ marginLeft: 4, background: "none", border: "1px solid #334155", color: "#94a3b8", padding: "5px 12px", borderRadius: 7, cursor: "pointer", fontSize: 12, fontWeight: 500, fontFamily: "inherit" }}
+            >
+              Sign out
+            </button>
+          </div>
+        </div>
+        <iframe
+          src={toolUrl}
+          style={{ flex: 1, border: "none", width: "100%" }}
+          title={toolLabel}
+          allow="clipboard-read; clipboard-write"
+        />
+      </div>
+    );
   }
 
   /* ── HUB ── */
@@ -230,40 +496,12 @@ export default function App() {
     const hasBilling    = tools.includes("billing");
     const cardCount     = (hasMonitoring ? 1 : 0) + (hasBilling ? 1 : 0);
 
-    function handleRevokedRelogin() {
-      try {
-        const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
-        delete revoked[user.email.toLowerCase()];
-        localStorage.setItem("cn_revoked_sessions", JSON.stringify(revoked));
-      } catch {}
-      localStorage.removeItem("cn_user");
-      setSessionRevoked(false);
-      setUser(null);
-      setPage("auth");
-    }
-
     return (
       <>
         <style>{hubCss}</style>
 
         {/* Session revoked overlay — blocks all interaction */}
-        {sessionRevoked && (
-          <div className="hub-revoked-overlay">
-            <div className="hub-revoked-card">
-              <div className="hub-revoked-icon">
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-              </div>
-              <div className="hub-revoked-title">Account Removed</div>
-              <div className="hub-revoked-sub">
-                Your account has been removed by the administrator.<br />
-                You no longer have access to CloudNexus.
-              </div>
-              <button className="hub-revoked-btn" onClick={handleRevokedRelogin}>
-                Back to Login
-              </button>
-            </div>
-          </div>
-        )}
+        {sessionRevoked && <RevokedOverlay onBack={handleRevokedRelogin} />}
 
         <div className="hub-page" style={sessionRevoked ? {pointerEvents:"none",userSelect:"none"} : {}}>
 
@@ -334,23 +572,12 @@ export default function App() {
   /* ── TOOL IFRAME PAGES ── */
   if (page === "monitoring" || page === "billing") {
     const toolUrl = page === "monitoring"
-      ? `http://localhost:3007?uid=${encodeURIComponent(user.email)}`
-      : `http://localhost:3008?uid=${encodeURIComponent(user.email)}`;
+      ? `${MONITORING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`
+      : `${BILLING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`;
     const toolLabel = page === "monitoring" ? "Monitoring" : "Billing";
     return (
       <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column" }}>
-        {sessionRevoked && (
-          <div className="hub-revoked-overlay">
-            <div className="hub-revoked-card">
-              <div className="hub-revoked-icon">
-                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-              </div>
-              <div className="hub-revoked-title">Account Removed</div>
-              <div className="hub-revoked-sub">Your account has been removed by the administrator.<br />You no longer have access to CloudNexus.</div>
-              <button className="hub-revoked-btn" onClick={handleRevokedRelogin}>Back to Login</button>
-            </div>
-          </div>
-        )}
+        {sessionRevoked && <RevokedOverlay onBack={handleRevokedRelogin} />}
         <div style={{ height: 52, background: "#0f172a", display: "flex", alignItems: "center", padding: "0 20px", gap: 16, flexShrink: 0, borderBottom: "1px solid #1e293b" }}>
           <button
             onClick={() => setPage("hub")}
@@ -402,6 +629,9 @@ export default function App() {
   if (page === "auth") {
     return <AuthPage onLogin={handleLogin} onBack={() => setPage("home")} />;
   }
+
+  /* ── MARKETING PAGES ── */
+  if (page === "pricing")  return <PricingPage  onNavigate={setPage} />;
 
   /* ── HOME ── */
   return <Landing onNavigate={setPage} />;

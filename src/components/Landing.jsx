@@ -1,5 +1,6 @@
-import { useState, useEffect, useRef } from "react";
-import { MenuBar } from "./MenuBar";
+import { useState, useEffect } from "react";
+import Navbar from "./Navbar.jsx";
+
 
 const CloudIcon = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
@@ -157,7 +158,6 @@ const makeNavItems = (onNavigate) => [
 
 /* ── Landing Page ── */
 export default function Landing({ onNavigate }) {
-  const [scrolled, setScrolled] = useState(false);
   const [activeCarousel, setActiveCarousel] = useState(null);
   const [bundleTab, setBundleTab] = useState("monitoring");
   const [contactForm, setContactForm] = useState({ name: "", phone: "", company: "", email: "", plan: "", message: "" });
@@ -169,6 +169,8 @@ export default function Landing({ onNavigate }) {
     if (plan) setContactForm(prev => ({ ...prev, plan }));
     setTimeout(() => document.getElementById("contact")?.scrollIntoView({ behavior: "smooth" }), 50);
   }
+
+  // removed: scroll → scrolled state (Navbar handles it)
 
   async function handleContactSubmit(e) {
     e.preventDefault();
@@ -191,12 +193,6 @@ export default function Landing({ onNavigate }) {
   }
 
   useEffect(() => {
-    const onScroll = () => setScrolled(window.scrollY > 10);
-    window.addEventListener("scroll", onScroll);
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
-
-  useEffect(() => {
     if (activeCarousel) { document.body.style.overflow = "hidden"; }
     else { document.body.style.overflow = ""; }
     return () => { document.body.style.overflow = ""; };
@@ -204,24 +200,7 @@ export default function Landing({ onNavigate }) {
 
   return (
     <>
-      {/* Navbar */}
-      <nav className={`navbar ${scrolled ? "scrolled" : ""}`}>
-        <div className="nav-container">
-          <div className="logo">
-            <div className="logo-icon"><CloudIcon /></div>
-            Cloud<span>Nexus</span>
-          </div>
-          <div className="nav-links">
-            <a href="#solutions">Features</a>
-            <a href="#solutions">Solutions</a>
-            <a href="#pricing">Pricing</a>
-            <a href="#contact">Contact Us</a>
-          </div>
-          <div className="nav-actions">
-            <button className="btn btn-primary btn-sm" onClick={() => onNavigate("auth")}>Login</button>
-          </div>
-        </div>
-      </nav>
+      <Navbar onNavigate={onNavigate} currentPage="home" />
 
       {/* Hero */}
       <section className="hero">
@@ -231,9 +210,9 @@ export default function Landing({ onNavigate }) {
               <span className="hero-badge-dot" />
               Now with multi-cloud AI forecasting
             </div>
-            <h1>Reduce cloud costs.<br /><span className="highlight">Maximize</span> performance.</h1>
+            <h1>Your clouds are talking.<br /><span className="highlight">Start</span> listening.</h1>
             <p className="hero-desc">
-              CloudNexus gives engineering teams complete visibility into cloud infrastructure usage, costs, and performance — all from one unified dashboard.
+              Connect AWS, Azure or GCP in five minutes and watch Cloud Nexus learn your baseline within a day.
             </p>
             <div className="hero-actions">
               <button className="btn btn-secondary btn-xl" onClick={() => scrollToContact()}>Book a Demo</button>
@@ -642,6 +621,7 @@ export default function Landing({ onNavigate }) {
       {activeCarousel === "billing" && (
         <Carousel cards={billingCards} title="Billing Features" onClose={() => setActiveCarousel(null)} />
       )}
+
     </>
   );
 }

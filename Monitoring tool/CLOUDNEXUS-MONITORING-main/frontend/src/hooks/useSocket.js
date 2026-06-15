@@ -8,15 +8,23 @@ export function useSocket(handlers) {
   handlersRef.current = handlers;
 
   useEffect(() => {
+    const uid = localStorage.getItem('cn_tool_uid') || '';
     const socket = io(window.location.origin, {
       transports: ['websocket', 'polling'],
       reconnectionAttempts: 10,
       reconnectionDelay: 2000,
+      query: uid ? { uid } : {},
     });
 
     socketRef.current = socket;
 
-    socket.on('connect', () => handlersRef.current.onConnect?.());
+    socket.on('connect', () => {
+      handlersRef.current.onConnect?.();
+      // Announce presence so the admin portal sees this user as online
+      const u = localStorage.getItem('cn_tool_uid')  || '';
+      const n = localStorage.getItem('cn_tool_name') || '';
+      if (u) socket.emit('user:online', { email: u, name: n });
+    });
     socket.on('disconnect', () => handlersRef.current.onDisconnect?.());
     socket.on('initial:state', data => handlersRef.current.onInitialState?.(data));
     socket.on('provider:updated', data => handlersRef.current.onProviderUpdated?.(data));
@@ -27,7 +35,11 @@ export function useSocket(handlers) {
     socket.on('topology:updated', data => handlersRef.current.onTopologyUpdated?.(data));
     socket.on('session:revoked', data => handlersRef.current.onSessionRevoked?.(data));
 
-    return () => socket.disconnect();
+    return () => {
+      const u = localStorage.getItem('cn_tool_uid') || '';
+      if (u) socket.emit('user:offline', { email: u });
+      socket.disconnect();
+    };
   }, []);
 
   const emit = useCallback((event, data) => {

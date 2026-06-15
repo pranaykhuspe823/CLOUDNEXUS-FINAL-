@@ -43,7 +43,10 @@ function AWSForm({ onConnected, onDisconnect, isConnected, isFetching }) {
       }
       const result = await api.connect('aws', creds);
       if (result.success) {
-        onConnected('aws', result);
+        const credMeta = { authType, region };
+        if (authType === 'keys' && accessKeyId) credMeta.accessKeyId = accessKeyId.slice(0, 4) + '****';
+        if (authType === 'role' && roleArn) credMeta.roleArn = roleArn;
+        onConnected('aws', result, credMeta);
       } else {
         setError(result.error || 'Connection failed');
       }
@@ -184,7 +187,7 @@ function GCPForm({ onConnected, onDisconnect, isConnected, isFetching }) {
         creds.accessToken = accessToken;
       }
       const result = await api.connect('gcp', creds);
-      if (result.success) onConnected('gcp', result);
+      if (result.success) onConnected('gcp', result, { projectId, authType });
       else setError(result.error || 'Connection failed');
     } catch (e) {
       setError(e.message);
@@ -271,7 +274,7 @@ function AzureForm({ onConnected, onDisconnect, isConnected, isFetching }) {
     try {
       const creds = { authType, subscriptionId, tenantId, clientId, clientSecret };
       const result = await api.connect('azure', creds);
-      if (result.success) onConnected('azure', result);
+      if (result.success) onConnected('azure', result, { subscriptionId, tenantId, clientId, authType });
       else setError(result.error || 'Connection failed');
     } catch (e) {
       setError(e.message);
@@ -351,8 +354,8 @@ export default function CloudConnectModal({ open, onClose, onAllConnected, initi
 
   if (!open) return null;
 
-  function handleConnected(provider, result) {
-    onAllConnected({ ...initialConnections, [provider]: { connected: true, ...result } });
+  function handleConnected(provider, result, credMeta) {
+    onAllConnected({ ...initialConnections, [provider]: { connected: true, ...result, credMeta: credMeta || {} } });
   }
 
   async function handleDisconnect(provider) {

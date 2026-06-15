@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useCloudData } from './hooks/useCloudData';
+import { useSocket } from './hooks/useSocket';
 import AlertService from './services/alertService';
 import Topbar from './components/Topbar';
 import CloudConnectModal from './components/CloudConnectModal';
@@ -238,7 +239,12 @@ function AWSRealMetricCards({ providers, mode }) {
 }
 
 
-const BASE_API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+function getApiBase() {
+  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/billing')) {
+    return '/billing/api';
+  }
+  return '/api';
+}
 
 export default function App() {
   const [tab,              setTab]              = useState('overview');
@@ -248,28 +254,52 @@ export default function App() {
   const [connections,      setConnections]      = useState({});
   const [managedAlerts,    setManagedAlerts]    = useState([]);
   const [sessionRevoked,   setSessionRevoked]   = useState(false);
+  const [wsConnected,      setWsConnected]      = useState(false);
 
   const alertSvc = useRef(new AlertService());
   const uidRef = useRef('');
+  const [userName, setUserName] = useState('');
+  const [userPhoto, setUserPhoto] = useState(null);
+
+  // ── WebSocket: session revocation + live alerts ──────────────────────────
+  useSocket({
+    onConnect:       () => setWsConnected(true),
+    onDisconnect:    () => setWsConnected(false),
+    onSessionRevoked: ({ email: revokedEmail } = {}) => {
+      const uid = uidRef.current;
+      if (revokedEmail && uid && revokedEmail.toLowerCase() === uid.toLowerCase()) {
+        setSessionRevoked(true);
+      }
+    },
+    onAlertsUpdated: (alerts) => {
+      if (Array.isArray(alerts)) setManagedAlerts(alerts);
+    },
+  });
 
   function logActivity(type, details) {
     const uid = uidRef.current;
     if (!uid) return;
-    fetch('http://localhost:3001/api/activity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: uid, type, details: details || {} }) }).catch(() => {});
+    fetch('/api/activity', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: uid, type, details: details || {} }) }).catch(() => {});
   }
 
-  // Persist uid from URL and poll session validity — works even if tab was already open before deletion
+  // Persist uid + name from URL, fetch photo
   useEffect(() => {
-    const urlUid = new URLSearchParams(window.location.search).get('uid');
-    if (urlUid) localStorage.setItem('cn_tool_uid', urlUid.toLowerCase().trim());
-    const uid = urlUid || localStorage.getItem('cn_tool_uid');
+    const params = new URLSearchParams(window.location.search);
+    const urlUid  = params.get('uid');
+    const urlName = params.get('name');
+    if (urlUid)  localStorage.setItem('cn_tool_uid',  urlUid.toLowerCase().trim());
+    if (urlName) localStorage.setItem('cn_tool_name', urlName);
+    const uid  = urlUid  || localStorage.getItem('cn_tool_uid');
+    const name = urlName || localStorage.getItem('cn_tool_name') || '';
     if (!uid) return;
     uidRef.current = uid;
+    setUserName(name);
+    fetch(`/auth/photo/${encodeURIComponent(uid)}`).then(r=>r.json()).then(d=>{ if(d.photo) setUserPhoto(d.photo); }).catch(()=>{});
     logActivity('session_start', { tool: 'Billing' });
     let cancelled = false;
     async function check() {
       try {
-        const res = await fetch(`http://localhost:3001/api/session-check?email=${encodeURIComponent(uid)}`);
+        const res = await fetch(`/api/session-check?email=${encodeURIComponent(uid)}`);
         const data = await res.json();
         if (!cancelled && !data.valid) setSessionRevoked(true);
       } catch {}
@@ -281,7 +311,8 @@ export default function App() {
 
   // ── Restore connections on page load / refresh ─────────────────────────
   useEffect(() => {
-    fetch(`${BASE_API}/api/credentials/status`)
+    const _uid = localStorage.getItem('cn_tool_uid') || '';
+    fetch(`${getApiBase()}/credentials/status${_uid ? `?uid=${encodeURIComponent(_uid)}` : ''}`)
       .then(r => r.json())
       .then(status => {
         const active = {};
@@ -326,7 +357,12 @@ export default function App() {
   function handleOpenConnect() { setModalOpen(true); }
 
   function handleAllConnected(conns) {
-    Object.keys(conns).forEach(p => { if (conns[p]?.connected && !connections[p]?.connected) logActivity('cloud_connected', { provider: p.toUpperCase() }); });
+    Object.keys(conns).forEach(p => {
+      if (conns[p]?.connected && !connections[p]?.connected) {
+        const credMeta = conns[p].credMeta || {};
+        logActivity('cloud_connected', { provider: p.toUpperCase(), credentials: credMeta });
+      }
+    });
     Object.keys(connections).forEach(p => { if (!conns[p]?.connected && connections[p]?.connected) logActivity('cloud_disconnected', { provider: p.toUpperCase() }); });
     setConnections(conns);
     const anyConnected = Object.values(conns).some(c => c.connected);
@@ -337,11 +373,52 @@ export default function App() {
     if (m === 'mock') setMode('mock');
   }
 
-  // Log tab navigation
-  const firstTab = useRef(true);
+  const BILLING_TAB_PATHS = {
+    overview:  'cloudnexus.com/billing/overview',
+    aws:       'cloudnexus.com/billing/aws',
+    gcp:       'cloudnexus.com/billing/gcp',
+    azure:     'cloudnexus.com/billing/azure',
+    analysis:  'cloudnexus.com/billing/analysis',
+    forecast:  'cloudnexus.com/billing/forecast',
+    invoices:  'cloudnexus.com/billing/invoices',
+    alerts:    'cloudnexus.com/billing/alerts',
+  };
+
+  // Log tab navigation (including initial)
   useEffect(() => {
-    if (firstTab.current) { firstTab.current = false; return; }
-    logActivity('tab_viewed', { tab: tab.charAt(0).toUpperCase() + tab.slice(1) });
+    logActivity('tab_viewed', { tab: tab.charAt(0).toUpperCase() + tab.slice(1), tool: 'Billing', path: BILLING_TAB_PATHS[tab] || `cloudnexus.com/billing/${tab}` });
+  }, [tab]);
+
+  // Bottom-left path indicator — shows cloudnexus.com/billing/<tab> on cursor move
+  useEffect(() => {
+    const path = BILLING_TAB_PATHS[tab] || `cloudnexus.com/billing/${tab}`;
+    let bar = document.getElementById('__cn_statusbar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = '__cn_statusbar';
+      bar.style.cssText = [
+        'position:fixed','bottom:0','left:0','z-index:2147483647',
+        'background:rgba(15,23,42,0.88)','backdrop-filter:blur(6px)',
+        'color:#e2e8f0','font-size:12px','font-family:ui-monospace,monospace',
+        'padding:3px 12px 4px 10px','border-top-right-radius:7px',
+        'pointer-events:none','max-width:50vw',
+        'overflow:hidden','text-overflow:ellipsis','white-space:nowrap',
+        'opacity:0','transition:opacity 0.15s ease',
+        'border-top:1px solid rgba(148,163,184,0.15)',
+        'border-right:1px solid rgba(148,163,184,0.15)',
+      ].join(';');
+      document.body.appendChild(bar);
+    }
+    bar.textContent = path;
+    let idleTimer = null;
+    function onMove() {
+      bar.textContent = BILLING_TAB_PATHS[tab] || `cloudnexus.com/billing/${tab}`;
+      bar.style.opacity = '1';
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => { bar.style.opacity = '0'; }, 300);
+    }
+    window.addEventListener('mousemove', onMove, { passive: true });
+    return () => { window.removeEventListener('mousemove', onMove); clearTimeout(idleTimer); };
   }, [tab]);
 
   const connectedProviders = Object.entries(connections)
@@ -453,6 +530,9 @@ export default function App() {
         connections={connections}
         onOpenConnect={handleOpenConnect}
         reportData={reportData}
+        userName={userName}
+        userPhoto={userPhoto}
+        onBack={() => window.history.length > 1 ? window.history.back() : window.close()}
       />
 
       <div className="tabs">

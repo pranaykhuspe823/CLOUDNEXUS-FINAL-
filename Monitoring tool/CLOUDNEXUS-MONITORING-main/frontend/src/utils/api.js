@@ -1,11 +1,30 @@
 // src/utils/api.js
 const BASE = '/api';
 
+function getUid() { return localStorage.getItem('cn_tool_uid') || ''; }
+
 async function request(method, path, body) {
-  const res = await fetch(`${BASE}${path}`, {
+  const uid = getUid();
+  let finalPath = path;
+  let finalBody = body;
+
+  if (method === 'GET' || method === 'DELETE') {
+    // Append uid as query param
+    if (uid) {
+      const sep = path.includes('?') ? '&' : '?';
+      finalPath = `${path}${sep}uid=${encodeURIComponent(uid)}`;
+    }
+  } else {
+    // POST / PUT: merge uid into body
+    if (uid) {
+      finalBody = body ? { ...body, uid } : { uid };
+    }
+  }
+
+  const res = await fetch(`${BASE}${finalPath}`, {
     method,
     headers: { 'Content-Type': 'application/json' },
-    ...(body ? { body: JSON.stringify(body) } : {}),
+    ...(finalBody ? { body: JSON.stringify(finalBody) } : {}),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));

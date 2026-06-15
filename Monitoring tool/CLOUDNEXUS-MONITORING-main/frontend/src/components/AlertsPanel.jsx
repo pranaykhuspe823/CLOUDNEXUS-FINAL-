@@ -16,6 +16,22 @@ function DailyReportPanel() {
   const [sending, setSending]       = useState(false);
   const [status, setStatus]         = useState(null); // { type: 'success'|'error', msg }
 
+  // Load saved schedule on mount; pre-fill email with uid so lookups always match
+  useEffect(() => {
+    const uid = new URLSearchParams(window.location.search).get('uid') || '';
+    if (!uid) return;
+    setEmail(uid);
+    api.getReportSchedule(uid).then(data => {
+      if (data.schedule) {
+        setEmail(data.schedule.email);
+        setTime(data.schedule.time);
+        setSavedEmail(data.schedule.email);
+        setSavedTime(data.schedule.time);
+        setScheduled(true);
+      }
+    }).catch(() => {});
+  }, []);
+
   function showStatus(type, msg) {
     setStatus({ type, msg });
     setTimeout(() => setStatus(null), 5000);
@@ -70,11 +86,16 @@ function DailyReportPanel() {
     }
   }
 
-  const hours = Array.from({ length: 24 }, (_, i) => {
-    const h = i.toString().padStart(2, '0');
-    const label = i === 0 ? '12:00 AM' : i < 12 ? `${i}:00 AM` : i === 12 ? '12:00 PM' : `${i - 12}:00 PM`;
-    return { value: `${h}:00`, label };
-  });
+  const slots = [];
+  for (let h = 0; h < 24; h++) {
+    for (let m = 0; m < 60; m += 15) {
+      const hStr = h.toString().padStart(2, '0');
+      const mStr = m.toString().padStart(2, '0');
+      const period = h < 12 ? 'AM' : 'PM';
+      const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+      slots.push({ value: `${hStr}:${mStr}`, label: `${h12}:${mStr} ${period}` });
+    }
+  }
 
   return (
     <div style={{
@@ -156,8 +177,8 @@ function DailyReportPanel() {
                   outline: 'none', cursor: 'pointer', minWidth: 130,
                 }}
               >
-                {hours.map(h => (
-                  <option key={h.value} value={h.value}>{h.label}</option>
+                {slots.map(s => (
+                  <option key={s.value} value={s.value}>{s.label}</option>
                 ))}
               </select>
             </div>
