@@ -6061,6 +6061,19 @@ io.on('connection', socket => {
     io.emit('users:online', [...onlineUsers.entries()].map(([e, d]) => ({ email: e, name: d.name, loginTime: d.loginTime })));
   });
 
+  // Admin switches a cloud account for a specific user → broadcast so the user's
+  // frontend can show a notification and reload their tool iframe.
+  socket.on('admin:switch-account', ({ targetEmail, provider, accountId, label }) => {
+    if (!targetEmail) return;
+    io.emit('account:switched', {
+      email: targetEmail.toLowerCase(),
+      provider,
+      accountId,
+      label,
+    });
+    logger.info(`[switch] ${provider} account switched for ${targetEmail} → "${label}" (id:${accountId})`);
+  });
+
 });
 
 // â”€â”€â”€ Cron: auto-refresh every 5 minutes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

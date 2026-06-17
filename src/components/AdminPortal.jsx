@@ -686,7 +686,8 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   const [cloudAccounts, setCloudAccounts]               = useState([]);
   const [cloudAccountsLoading, setCloudAccountsLoading] = useState(false);
   const [orgUserCloudAccess, setOrgUserCloudAccess]     = useState({}); // email → [{id, provider, label}]
-  const [cloudAccountModal, setCloudAccountModal]       = useState(null); // {userEmail, provider, accounts}
+  const [cloudAccountModal, setCloudAccountModal]       = useState(null); // {userEmail, userName, provider, accounts}
+  const [switchingAccount, setSwitchingAccount]         = useState(null); // {accountId, done}
   const [addCloudAccountModal, setAddCloudAccountModal] = useState(false);
   const [assignCloudAccountModal, setAssignCloudAccountModal] = useState(null); // account object
   const [cloudAccountForm, setCloudAccountForm] = useState({ provider: 'aws', label: '', creds: {} });
@@ -714,6 +715,20 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
       .then(r => r.json())
       .then(d => { setOrgUserCloudAccess(d.access || {}); })
       .catch(() => {});
+  }
+
+  function handleSwitchAccount(account) {
+    setSwitchingAccount({ accountId: account.id, done: false });
+    socketRef.current?.emit('admin:switch-account', {
+      targetEmail: cloudAccountModal.userEmail,
+      provider: account.provider,
+      accountId: account.id,
+      label: account.label,
+    });
+    setTimeout(() => {
+      setSwitchingAccount({ accountId: account.id, done: true });
+      setTimeout(() => setSwitchingAccount(null), 1800);
+    }, 500);
   }
 
   async function openCredViewFromUserModal(account) {
@@ -3214,39 +3229,80 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
 
         {/* Cloud Account Detail Modal (provider badge click in Users tab) */}
         {cloudAccountModal && (
-          <div className="ap-modal-overlay" onClick={() => setCloudAccountModal(null)}>
-            <div className="ap-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 440 }}>
+          <div className="ap-modal-overlay" onClick={() => { setCloudAccountModal(null); setSwitchingAccount(null); }}>
+            <div className="ap-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 460 }}>
               <div className="ap-modal-header">
                 <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <ProviderLogo provider={cloudAccountModal.provider} size={18} />
                   {cloudAccountModal.provider.toUpperCase()} Accounts — {cloudAccountModal.userName}
                 </span>
-                <button className="ap-modal-close" onClick={() => setCloudAccountModal(null)}>×</button>
+                <button className="ap-modal-close" onClick={() => { setCloudAccountModal(null); setSwitchingAccount(null); }}>×</button>
               </div>
               <div className="ap-modal-body">
                 {cloudAccountModal.accounts.length === 0 ? (
                   <div style={{ fontSize: 13, color: '#94a3b8' }}>No accounts assigned.</div>
                 ) : (
+                  <>
+                    {cloudAccountModal.accounts.length > 1 && (
+                      <div style={{ fontSize: 12, color: '#64748b', marginBottom: 12, padding: '8px 12px', background: '#f8fafc', borderRadius: 8, border: '1px solid #e2e8f0' }}>
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{marginRight:5,verticalAlign:'middle'}}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                        Click <strong>Switch</strong> to change which {cloudAccountModal.provider.toUpperCase()} account this user sees in their portal.
+                      </div>
+                    )}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                    {cloudAccountModal.accounts.map(a => (
-                      <div key={a.id} style={{ padding: '10px 14px', border: '1px solid #e2e8f0', borderRadius: 8, background: '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                        <div>
-                          <div style={{ fontWeight: 700, color: '#0f172a', fontSize: 13 }}>{a.label}</div>
+                    {cloudAccountModal.accounts.map(a => {
+                      const isSwitching = switchingAccount?.accountId === a.id && !switchingAccount?.done;
+                      const isDone      = switchingAccount?.accountId === a.id && switchingAccount?.done;
+                      return (
+                      <div key={a.id} style={{ padding: '12px 14px', border: `1.5px solid ${isDone ? '#22c55e' : '#e2e8f0'}`, borderRadius: 10, background: isDone ? '#f0fdf4' : '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, transition: 'border-color 0.2s, background 0.2s' }}>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontWeight: 700, color: '#0f172a', fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <ProviderLogo provider={a.provider} size={14} />
+                            {a.label}
+                            {isDone && (
+                              <span style={{ fontSize: 10, fontWeight: 700, color: '#16a34a', background: '#dcfce7', borderRadius: 4, padding: '1px 6px', letterSpacing: 0.3 }}>SWITCHED</span>
+                            )}
+                          </div>
                           <div style={{ fontSize: 11, color: '#22c55e', fontWeight: 600, marginTop: 3 }}>● Connected</div>
                         </div>
-                        <button
-                          onClick={() => { setCloudAccountModal(null); openCredViewFromUserModal(a); }}
-                          style={{ fontSize: 11, fontWeight: 600, padding: '4px 10px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit' }}
-                        >
-                          View Credentials
-                        </button>
+                        <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
+                          {cloudAccountModal.accounts.length > 1 && (
+                            <button
+                              onClick={() => !switchingAccount && handleSwitchAccount(a)}
+                              disabled={!!switchingAccount}
+                              style={{
+                                fontSize: 11, fontWeight: 700, padding: '5px 12px',
+                                background: isDone ? '#16a34a' : isSwitching ? '#1d4ed8' : '#2563eb',
+                                color: '#fff', border: 'none', borderRadius: 7, cursor: switchingAccount ? 'not-allowed' : 'pointer',
+                                fontFamily: 'inherit', opacity: switchingAccount && !isSwitching && !isDone ? 0.4 : 1,
+                                display: 'flex', alignItems: 'center', gap: 5, transition: 'all 0.2s',
+                              }}
+                            >
+                              {isSwitching ? (
+                                <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" style={{animation:'spin 0.7s linear infinite'}} strokeLinecap="round"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></svg> Switching…</>
+                              ) : isDone ? (
+                                <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Switched!</>
+                              ) : (
+                                <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg> Switch</>
+                              )}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => { setCloudAccountModal(null); setSwitchingAccount(null); openCredViewFromUserModal(a); }}
+                            style={{ fontSize: 11, fontWeight: 600, padding: '5px 10px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: 7, cursor: 'pointer', fontFamily: 'inherit' }}
+                          >
+                            View Credentials
+                          </button>
+                        </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
+                  </>
                 )}
               </div>
               <div style={{ padding: '12px 24px', borderTop: '1px solid #f1f5f9', textAlign: 'right' }}>
-                <button onClick={() => setCloudAccountModal(null)} style={{ padding: '7px 18px', border: '1px solid #e2e8f0', borderRadius: 7, background: '#f8fafc', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>Close</button>
+                <button onClick={() => { setCloudAccountModal(null); setSwitchingAccount(null); }} style={{ padding: '7px 18px', border: '1px solid #e2e8f0', borderRadius: 7, background: '#f8fafc', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>Close</button>
               </div>
             </div>
           </div>

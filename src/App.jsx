@@ -60,6 +60,45 @@ function updateLastSeen(email) {
   if (data[email]) { data[email].lastSeen = Date.now(); _writeActivity(data); }
 }
 
+const CLOUD_COLORS = { aws: '#FF9900', gcp: '#4285F4', azure: '#0078D4' };
+
+function AccountSwitchToast({ toast, onClose, baseUrl }) {
+  if (!toast) return null;
+  const color = CLOUD_COLORS[toast.provider] || '#2563eb';
+  return (
+    <div style={{
+      position: 'fixed', top: 20, right: 24, zIndex: 99999,
+      background: '#0f172a', borderRadius: 14, padding: '14px 16px 14px 14px',
+      display: 'flex', alignItems: 'flex-start', gap: 12,
+      boxShadow: '0 8px 40px rgba(0,0,0,0.45), 0 2px 8px rgba(0,0,0,0.2)',
+      border: '1px solid #1e293b',
+      animation: 'cn-toast-in 0.4s cubic-bezier(0.34,1.56,0.64,1)',
+      minWidth: 280, maxWidth: 340,
+    }}>
+      <style>{`@keyframes cn-toast-in{from{transform:translateX(calc(100% + 32px));opacity:0}to{transform:translateX(0);opacity:1}}`}</style>
+      <div style={{ width: 36, height: 36, borderRadius: 9, background: color + '20', border: `1.5px solid ${color}55`, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, marginTop: 1 }}>
+        <img src={`${baseUrl}logos/${toast.provider}.svg`} alt={toast.provider} style={{ width: 20, height: 20, objectFit: 'contain' }} />
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: '#f1f5f9', marginBottom: 3, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+          Account Switched
+        </div>
+        <div style={{ fontSize: 12, color: '#94a3b8', lineHeight: 1.5 }}>
+          Admin switched your{' '}
+          <span style={{ color, fontWeight: 700 }}>{toast.provider.toUpperCase()}</span>
+          {' '}account to{' '}
+          <span style={{ color: '#e2e8f0', fontWeight: 600 }}>"{toast.label}"</span>
+        </div>
+      </div>
+      <button
+        onClick={onClose}
+        style={{ background: 'none', border: 'none', color: '#475569', cursor: 'pointer', padding: '2px 4px', fontSize: 18, lineHeight: 1, flexShrink: 0, marginLeft: 4 }}
+      >×</button>
+    </div>
+  );
+}
+
 function RevokedOverlay({ onBack, reason }) {
   const kicked = reason === 'kicked';
   return (
@@ -156,6 +195,10 @@ const hubCss = `
   .hub-main { padding: 40px 20px; }
   .hub-welcome h1 { font-size: 28px; }
 }
+@keyframes cn-toast-in {
+  from { transform: translateX(calc(100% + 32px)); opacity: 0; }
+  to   { transform: translateX(0); opacity: 1; }
+}
 `;
 
 const USER_PHOTO_KEY = (email) => `cn_user_photo_${email}`;
@@ -196,6 +239,8 @@ export default function App() {
   const [userPhoto, setUserPhoto] = useState(null);
   const [sessionRevoked, setSessionRevoked] = useState(false);
   const [revokeReason, setRevokeReason] = useState(null);
+  const [accountSwitchToast, setAccountSwitchToast] = useState(null); // {provider, label}
+  const [iframeReloadKey, setIframeReloadKey] = useState(0);
 
   const socketRef = useRef(null);
 
@@ -241,6 +286,21 @@ export default function App() {
     }
     socket.on('tools:updated', onToolsUpdated);
     return () => socket.off('tools:updated', onToolsUpdated);
+  }, [user?.email]); // eslint-disable-line
+
+  // Admin switched a cloud account for this user → show toast + reload tool iframe
+  useEffect(() => {
+    const socket = socketRef.current;
+    if (!socket || !user?.email) return;
+    const myEmail = user.email.toLowerCase();
+    function onAccountSwitched({ email, provider, label }) {
+      if (!email || email.toLowerCase() !== myEmail) return;
+      setAccountSwitchToast({ provider, label });
+      setIframeReloadKey(k => k + 1);
+      setTimeout(() => setAccountSwitchToast(null), 4500);
+    }
+    socket.on('account:switched', onAccountSwitched);
+    return () => socket.off('account:switched', onAccountSwitched);
   }, [user?.email]); // eslint-disable-line
 
   const SESSION_TTL = 2 * 24 * 60 * 60 * 1000;
@@ -528,6 +588,7 @@ export default function App() {
     return (
       <>
         <style>{hubCss}</style>
+        <AccountSwitchToast toast={accountSwitchToast} onClose={() => setAccountSwitchToast(null)} baseUrl={import.meta.env.BASE_URL} />
 
         {/* Session revoked overlay — blocks all interaction */}
         {sessionRevoked && <RevokedOverlay onBack={handleRevokedRelogin} reason={revokeReason} />}
@@ -606,6 +667,7 @@ export default function App() {
     const toolLabel = page === "monitoring" ? "Monitoring" : "Billing";
     return (
       <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column" }}>
+        <AccountSwitchToast toast={accountSwitchToast} onClose={() => setAccountSwitchToast(null)} baseUrl={import.meta.env.BASE_URL} />
         {sessionRevoked && <RevokedOverlay onBack={handleRevokedRelogin} reason={revokeReason} />}
         <div style={{ height: 52, background: "#0f172a", display: "flex", alignItems: "center", padding: "0 20px", gap: 16, flexShrink: 0, borderBottom: "1px solid #1e293b" }}>
           <button
@@ -645,6 +707,7 @@ export default function App() {
           </div>
         </div>
         <iframe
+          key={iframeReloadKey}
           src={toolUrl}
           style={{ flex: 1, border: "none", width: "100%" }}
           title={toolLabel}
