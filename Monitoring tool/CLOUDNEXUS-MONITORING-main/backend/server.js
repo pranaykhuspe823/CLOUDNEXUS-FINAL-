@@ -239,7 +239,7 @@ class AWSService {
 
   getClientConfig(region) {
     const cfg = { region: region || this.region };
-    if (this.creds.authType === 'keys') {
+    if (this.creds.accessKeyId && this.creds.secretAccessKey) {
       cfg.credentials = {
         accessKeyId: this.creds.accessKeyId,
         secretAccessKey: this.creds.secretAccessKey,
