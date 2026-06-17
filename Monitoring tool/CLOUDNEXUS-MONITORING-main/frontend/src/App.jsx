@@ -58,6 +58,7 @@ export default function App() {
   const [filterStatus, setFilterStatus] = useState('all');
   const [backendOnline, setBackendOnline] = useState(false);
   const [sessionRevoked, setSessionRevoked] = useState(false);
+  const [revokeReason, setRevokeReason] = useState(null);
   const uidRef = useRef('');
   const [userName, setUserName] = useState('');
   const [userPhoto, setUserPhoto] = useState(null);
@@ -84,10 +85,13 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const urlUid  = params.get('uid');
     const urlName = params.get('name');
+    const urlSid  = params.get('sid');
     if (urlUid)  localStorage.setItem('cn_tool_uid',  urlUid.toLowerCase().trim());
     if (urlName) localStorage.setItem('cn_tool_name', urlName);
+    if (urlSid)  localStorage.setItem('cn_tool_sid',  urlSid);
     const uid  = urlUid  || localStorage.getItem('cn_tool_uid');
     const name = urlName || localStorage.getItem('cn_tool_name') || '';
+    const sid  = urlSid  || localStorage.getItem('cn_tool_sid') || '';
     if (!uid) return;
     uidRef.current = uid;
     setUserName(name);
@@ -96,9 +100,12 @@ export default function App() {
     let cancelled = false;
     async function check() {
       try {
-        const res = await fetch(`/api/session-check?email=${encodeURIComponent(uid)}`);
+        const res = await fetch(`/api/session-check?email=${encodeURIComponent(uid)}&sessionId=${encodeURIComponent(sid)}`);
         const data = await res.json();
-        if (!cancelled && !data.valid) setSessionRevoked(true);
+        if (!cancelled && !data.valid) {
+          setRevokeReason(data.reason === 'logged_in_elsewhere' ? 'kicked' : 'deleted');
+          setSessionRevoked(true);
+        }
       } catch {}
     }
     check();
@@ -149,9 +156,13 @@ export default function App() {
     },
     onAlertsUpdated: (alerts) => setRealAlerts(alerts),
     onTopologyUpdated: (topology) => setRealTopology(topology),
-    onSessionRevoked: ({ email }) => {
+    onSessionRevoked: ({ email, sessionId: winningSessionId, reason }) => {
       const uid = localStorage.getItem('cn_tool_uid') || new URLSearchParams(window.location.search).get('uid');
-      if (uid && email && uid.toLowerCase() === email.toLowerCase()) setSessionRevoked(true);
+      if (!uid || !email || uid.toLowerCase() !== email.toLowerCase()) return;
+      const mySid = localStorage.getItem('cn_tool_sid') || '';
+      if (reason === 'kicked' && winningSessionId && winningSessionId === mySid) return;
+      setRevokeReason(reason === 'kicked' ? 'kicked' : 'deleted');
+      setSessionRevoked(true);
     },
   });
 
@@ -330,9 +341,11 @@ export default function App() {
         <div style={{width:60,height:60,background:'#fee2e2',borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 20px'}}>
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
         </div>
-        <div style={{fontSize:20,fontWeight:800,color:'#0f172a',marginBottom:10,letterSpacing:'-0.4px'}}>Account Removed</div>
+        <div style={{fontSize:20,fontWeight:800,color:'#0f172a',marginBottom:10,letterSpacing:'-0.4px'}}>{revokeReason === 'kicked' ? 'Signed In Elsewhere' : 'Account Removed'}</div>
         <div style={{fontSize:14,color:'#64748b',lineHeight:1.6,marginBottom:28}}>
-          Your account has been removed by the administrator.<br/>You no longer have access to this tool.
+          {revokeReason === 'kicked'
+            ? <>Your account was just signed in on another device.<br/>For security, only one device can be active at a time.</>
+            : <>Your account has been removed by the administrator.<br/>You no longer have access to this tool.</>}
         </div>
         <button
           onClick={() => window.location.href = 'http://localhost:3006'}
@@ -515,8 +528,8 @@ export default function App() {
       />
       <CloudConnectModal
         open={modalOpen}
+        uid={uidRef.current}
         onClose={() => { setModalOpen(false); if (!Object.values(connections).some(c => c.connected)) setMode('mock'); }}
-        onAllConnected={handleAllConnected}
         initialConnections={connections}
         fetchingProviders={fetchingProviders}
       />

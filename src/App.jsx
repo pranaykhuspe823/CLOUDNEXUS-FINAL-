@@ -5,6 +5,7 @@ import AuthPage from "./components/AuthPage.jsx";
 import AdminPortal from "./components/AdminPortal.jsx";
 import SuperAdminPortal from "./components/SuperAdminPortal.jsx";
 import PricingPage from "./components/PricingPage.jsx";
+import ActivationPage from "./components/ActivationPage.jsx";
 
 /* ── Tunnel URL support (Cloudflare share mode) ────────────────────
    When share.ps1 is used, the main tunnel URL includes ?_murl=...
@@ -59,16 +60,19 @@ function updateLastSeen(email) {
   if (data[email]) { data[email].lastSeen = Date.now(); _writeActivity(data); }
 }
 
-function RevokedOverlay({ onBack }) {
+function RevokedOverlay({ onBack, reason }) {
+  const kicked = reason === 'kicked';
   return (
     <div style={{position:'fixed',inset:0,background:'rgba(7,17,31,0.93)',backdropFilter:'blur(6px)',zIndex:9999,display:'flex',alignItems:'center',justifyContent:'center',padding:24}}>
       <div style={{background:'#fff',borderRadius:20,padding:'40px 36px',maxWidth:420,width:'100%',textAlign:'center',boxShadow:'0 24px 64px rgba(0,0,0,0.3)'}}>
         <div style={{width:60,height:60,background:'#fee2e2',borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 20px'}}>
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
         </div>
-        <div style={{fontSize:20,fontWeight:800,color:'#0f172a',marginBottom:10,letterSpacing:'-0.4px'}}>Account Removed</div>
+        <div style={{fontSize:20,fontWeight:800,color:'#0f172a',marginBottom:10,letterSpacing:'-0.4px'}}>{kicked ? 'Signed In Elsewhere' : 'Account Removed'}</div>
         <div style={{fontSize:14,color:'#64748b',lineHeight:1.6,marginBottom:28}}>
-          Your account has been removed by the administrator.<br />You no longer have access to CloudNexus.
+          {kicked
+            ? <>Your account was just signed in on another device.<br />For security, only one device can be active at a time.</>
+            : <>Your account has been removed by the administrator.<br />You no longer have access to CloudNexus.</>}
         </div>
         <button onClick={onBack} style={{display:'inline-block',background:'#2563eb',color:'#fff',fontSize:14,fontWeight:700,padding:'12px 32px',borderRadius:10,border:'none',cursor:'pointer',fontFamily:'inherit'}}>
           Back to Login
@@ -167,6 +171,7 @@ const PAGE_PATHS = {
   "admin-monitoring": "/admin/monitoring",
   "admin-billing":    "/admin/billing",
   superadmin:        "/superadmin",
+  activate:          "/activate",
 };
 const PATH_PAGES = Object.fromEntries(Object.entries(PAGE_PATHS).map(([k,v]) => [v, k]));
 
@@ -180,12 +185,17 @@ function navigate(setPage) {
 }
 
 export default function App() {
-  const [_page, _setPage] = useState("home");
+  const [_page, _setPage] = useState(() => {
+    // Activation links take priority over any saved session
+    if (window.location.pathname === "/activate") return "activate";
+    return PATH_PAGES[window.location.pathname] ?? "home";
+  });
   const setPage = navigate(_setPage);
   const page = _page;
   const [user, setUser] = useState(null);
   const [userPhoto, setUserPhoto] = useState(null);
   const [sessionRevoked, setSessionRevoked] = useState(false);
+  const [revokeReason, setRevokeReason] = useState(null);
 
   const socketRef = useRef(null);
 
@@ -201,12 +211,18 @@ export default function App() {
     const socket = socketRef.current;
     if (!socket || !user?.email) return;
     const myEmail = user.email.toLowerCase();
-    function onRevoked({ email: revokedEmail }) {
-      if (revokedEmail && revokedEmail.toLowerCase() === myEmail) setSessionRevoked(true);
+    const mySessionId = user.sessionId;
+    function onRevoked({ email: revokedEmail, sessionId: winningSessionId, reason }) {
+      if (!revokedEmail || revokedEmail.toLowerCase() !== myEmail) return;
+      // A "kicked" event carries the sessionId of the device that just logged
+      // in — if that's us, ignore it; otherwise we're the device being kicked.
+      if (reason === 'kicked' && winningSessionId && winningSessionId === mySessionId) return;
+      setRevokeReason(reason === 'kicked' ? 'kicked' : 'deleted');
+      setSessionRevoked(true);
     }
     socket.on('session:revoked', onRevoked);
     return () => socket.off('session:revoked', onRevoked);
-  }, [user?.email]); // eslint-disable-line
+  }, [user?.email, user?.sessionId]); // eslint-disable-line
 
   // Real-time tool access updates — when admin changes plan, hub cards update instantly
   useEffect(() => {
@@ -237,7 +253,11 @@ export default function App() {
         const savedPhoto = localStorage.getItem(USER_PHOTO_KEY(s.email)) || null;
         setUserPhoto(savedPhoto);
         fetch(`/auth/photo/${encodeURIComponent(s.email)}`).then(r=>r.json()).then(d=>{ if(d.photo){ localStorage.setItem(USER_PHOTO_KEY(s.email), d.photo); setUserPhoto(d.photo); } }).catch(()=>{});
-        setPage(s.isAdmin ? "admin" : "hub");
+        // Don't hijack a deep-linked super-admin portal refresh — that portal
+        // has its own independent login and isn't part of the regular user session.
+        if (PATH_PAGES[window.location.pathname] !== 'superadmin') {
+          setPage(s.isAdmin ? "admin" : "hub");
+        }
       } else {
         localStorage.removeItem("cn_user");
       }
@@ -349,6 +369,7 @@ export default function App() {
   useEffect(() => {
     if (!["hub", "monitoring", "billing", "admin-monitoring", "admin-billing"].includes(page) || !user?.email) return;
     const email = user.email.toLowerCase();
+    const sessionId = user?.sessionId || '';
 
     const loginTime = user?.loginTime || 0;
 
@@ -359,17 +380,17 @@ export default function App() {
       try {
         const revoked = JSON.parse(localStorage.getItem("cn_revoked_sessions") || "{}");
         const revokedAt = revoked[email];
-        if (revokedAt && revokedAt > loginTime) setSessionRevoked(true);
+        if (revokedAt && revokedAt > loginTime) { setRevokeReason('deleted'); setSessionRevoked(true); }
       } catch {}
     }
 
     async function checkBackend() {
       try {
-        const res = await fetch(`/api/session-check?email=${encodeURIComponent(email)}`);
+        const res = await fetch(`/api/session-check?email=${encodeURIComponent(email)}&sessionId=${encodeURIComponent(sessionId)}`);
         const data = await res.json();
         // Only treat as revoked if the backend says invalid AND we have no loginTime
         // override — the DB-aware endpoint handles re-created users correctly.
-        if (!data.valid) setSessionRevoked(true);
+        if (!data.valid) { setRevokeReason(data.reason === 'logged_in_elsewhere' ? 'kicked' : 'deleted'); setSessionRevoked(true); }
       } catch {}
     }
 
@@ -382,7 +403,7 @@ export default function App() {
     }
     window.addEventListener("storage", onStorage);
     return () => { clearInterval(id); window.removeEventListener("storage", onStorage); };
-  }, [page, user?.email]); // eslint-disable-line
+  }, [page, user?.email, user?.sessionId]); // eslint-disable-line
 
   function handleRevokedRelogin() {
     try {
@@ -392,6 +413,7 @@ export default function App() {
     } catch {}
     localStorage.removeItem("cn_user");
     setSessionRevoked(false);
+    setRevokeReason(null);
     setUser(null);
     setPage("auth");
   }
@@ -404,6 +426,7 @@ export default function App() {
       localStorage.setItem("cn_revoked_sessions", JSON.stringify(revoked));
     } catch {}
     setSessionRevoked(false);
+    setRevokeReason(null);
     const sessionData = { ...userData, loginTime: Date.now() };
     localStorage.setItem("cn_user", JSON.stringify(sessionData));
     setUser(sessionData);
@@ -423,6 +446,12 @@ export default function App() {
     setPage("home");
   }
 
+  /* ── ACCOUNT ACTIVATION ── */
+  if (page === "activate") {
+    const token = new URLSearchParams(window.location.search).get("token") || "";
+    return <ActivationPage token={token} onDone={() => setPage("auth")} />;
+  }
+
   /* ── SUPER ADMIN (Core5) ── */
   if (page === "superadmin") {
     return <SuperAdminPortal onBack={() => setPage("home")} />;
@@ -438,8 +467,8 @@ export default function App() {
     const tool       = page === "admin-monitoring" ? "monitoring" : "billing";
     const toolLabel  = tool === "monitoring" ? "Monitoring" : "Billing";
     const toolUrl    = tool === "monitoring"
-      ? `${MONITORING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`
-      : `${BILLING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`;
+      ? `${MONITORING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}&sid=${encodeURIComponent(user.sessionId || '')}`
+      : `${BILLING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}&sid=${encodeURIComponent(user.sessionId || '')}`;
     return (
       <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column" }}>
         <div style={{ height: 52, background: "#0f172a", display: "flex", alignItems: "center", padding: "0 20px", gap: 16, flexShrink: 0, borderBottom: "1px solid #1e293b" }}>
@@ -501,7 +530,7 @@ export default function App() {
         <style>{hubCss}</style>
 
         {/* Session revoked overlay — blocks all interaction */}
-        {sessionRevoked && <RevokedOverlay onBack={handleRevokedRelogin} />}
+        {sessionRevoked && <RevokedOverlay onBack={handleRevokedRelogin} reason={revokeReason} />}
 
         <div className="hub-page" style={sessionRevoked ? {pointerEvents:"none",userSelect:"none"} : {}}>
 
@@ -572,12 +601,12 @@ export default function App() {
   /* ── TOOL IFRAME PAGES ── */
   if (page === "monitoring" || page === "billing") {
     const toolUrl = page === "monitoring"
-      ? `${MONITORING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`
-      : `${BILLING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}`;
+      ? `${MONITORING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}&sid=${encodeURIComponent(user.sessionId || '')}`
+      : `${BILLING_BASE}?uid=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name || '')}&sid=${encodeURIComponent(user.sessionId || '')}`;
     const toolLabel = page === "monitoring" ? "Monitoring" : "Billing";
     return (
       <div style={{ position: "fixed", inset: 0, display: "flex", flexDirection: "column" }}>
-        {sessionRevoked && <RevokedOverlay onBack={handleRevokedRelogin} />}
+        {sessionRevoked && <RevokedOverlay onBack={handleRevokedRelogin} reason={revokeReason} />}
         <div style={{ height: 52, background: "#0f172a", display: "flex", alignItems: "center", padding: "0 20px", gap: 16, flexShrink: 0, borderBottom: "1px solid #1e293b" }}>
           <button
             onClick={() => setPage("hub")}

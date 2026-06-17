@@ -1,9 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { io as socketIO } from "socket.io-client";
 
-const SA_EMAIL = "core5@core5.co.in";
-const SA_PASS  = "Core5@2022";
-
 function genPassword() {
   const up  = "ABCDEFGHJKLMNPQRSTUVWXYZ";
   const lo  = "abcdefghjkmnpqrstuvwxyz";
@@ -36,21 +33,46 @@ function copyText(text) {
 
 export default function SuperAdminPortal({ onBack }) {
   /* ── Auth ── */
-  const [authed, setAuthed]     = useState(() => sessionStorage.getItem("cn_sa_ok") === "1");
-  const [loginEmail, setLE]     = useState("");
-  const [loginPass,  setLP]     = useState("");
-  const [loginErr,   setLErr]   = useState("");
+  const [authed,      setAuthed]     = useState(() => !!sessionStorage.getItem("cn_sa_token"));
+  const [loginEmail,  setLE]         = useState("");
+  const [loginPass,   setLP]         = useState("");
+  const [loginErr,    setLErr]       = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
 
-  function handleLogin() {
-    if (loginEmail.trim() === SA_EMAIL && loginPass === SA_PASS) {
-      sessionStorage.setItem("cn_sa_ok", "1");
-      setAuthed(true);
-    } else {
-      setLErr("Invalid credentials.");
+  // Helper: include SA token on every backend call; auto-logout if session expires
+  async function saFetch(url, opts = {}) {
+    const token = sessionStorage.getItem("cn_sa_token") || "";
+    const headers = { ...(opts.headers || {}), "x-sa-token": token };
+    const res = await fetch(url, { ...opts, headers });
+    if (res.status === 401) {
+      sessionStorage.removeItem("cn_sa_token");
+      setAuthed(false);
     }
+    return res;
   }
 
-  function logout() { sessionStorage.removeItem("cn_sa_ok"); setAuthed(false); }
+  async function handleLogin() {
+    const emailVal = loginEmail.trim();
+    const passVal  = loginPass;
+    if (!emailVal || !passVal) { setLErr("Enter email and password."); return; }
+    setLoginLoading(true); setLErr("");
+    try {
+      const res  = await fetch("/superadmin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: emailVal, password: passVal }),
+      });
+      const data = await res.json();
+      if (!res.ok) { setLErr(data.error || "Invalid credentials."); }
+      else {
+        sessionStorage.setItem("cn_sa_token", data.token);
+        setAuthed(true);
+      }
+    } catch { setLErr("Cannot reach the server. Is the backend running?"); }
+    setLoginLoading(false);
+  }
+
+  function logout() { sessionStorage.removeItem("cn_sa_token"); setAuthed(false); }
 
   /* ── Settings ── */
   const [settings,     setSettings]     = useState({ uniqueDomains: true });
@@ -58,18 +80,18 @@ export default function SuperAdminPortal({ onBack }) {
   const [savingSettings, setSavingSettings] = useState(false);
 
   const fetchSettings = useCallback(() => {
-    fetch("/superadmin/settings")
+    saFetch("/superadmin/settings")
       .then(r => r.json())
       .then(d => { if (d && !d.error) setSettings(d); })
       .catch(() => {});
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function toggleUniqueDomains() {
     const next = { ...settings, uniqueDomains: !settings.uniqueDomains };
     setSettings(next);
     setSavingSettings(true);
     try {
-      await fetch("/superadmin/settings", {
+      await saFetch("/superadmin/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(next),
@@ -91,14 +113,14 @@ export default function SuperAdminPortal({ onBack }) {
 
   async function handleCancelPlan(email) {
     setCancelling(email);
-    await fetch(`/superadmin/admins/${encodeURIComponent(email)}/plan`, { method: 'DELETE' });
+    await saFetch(`/superadmin/admins/${encodeURIComponent(email)}/plan`, { method: 'DELETE' });
     setConfirmCancel(null); setCancelling(null); fetchAdmins();
   }
 
   async function handleDelete(email) {
     setDeleting(email);
     try {
-      await fetch(`/superadmin/admins/${encodeURIComponent(email)}`, { method: "DELETE" });
+      await saFetch(`/superadmin/admins/${encodeURIComponent(email)}`, { method: "DELETE" });
       setConfirmDel(null);
       setExpanded(e => e === email ? null : e);
       fetchAdmins();
@@ -108,11 +130,11 @@ export default function SuperAdminPortal({ onBack }) {
 
   const fetchAdmins = useCallback(() => {
     setLoading(true);
-    fetch("/superadmin/admins")
+    saFetch("/superadmin/admins")
       .then(r => r.json())
       .then(d => { setAdmins(Array.isArray(d) ? d : []); setLoading(false); })
       .catch(() => setLoading(false));
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!authed) return;
@@ -129,9 +151,31 @@ export default function SuperAdminPortal({ onBack }) {
   const [createErr, setCreateErr] = useState("");
   const [copied, setCopied]       = useState("");
 
+  /* ── Activation Link ── */
+  const [sendTo,       setSendTo]       = useState("");
+  const [sendingLink,  setSendingLink]  = useState(false);
+  const [linkSent,     setLinkSent]     = useState(false);
+  const [linkErr,      setLinkErr]      = useState("");
+
+  async function handleSendActivation() {
+    if (!sendTo.trim()) { setLinkErr("Enter an email address."); return; }
+    setSendingLink(true); setLinkErr(""); setLinkSent(false);
+    try {
+      const r = await saFetch("/superadmin/send-activation", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adminEmail: result.email, sendTo: sendTo.trim() }),
+      });
+      const d = await r.json();
+      if (!r.ok) { setLinkErr(d.error || "Failed to send."); }
+      else { setLinkSent(true); }
+    } catch { setLinkErr("Network error."); }
+    setSendingLink(false);
+  }
+
   function openModal() {
     setForm({ name:"", email:"", passType:"auto", password: genPassword() });
-    setResult(null); setCreateErr(""); setShowModal(true);
+    setResult(null); setCreateErr(""); setSendTo(""); setLinkSent(false); setLinkErr(""); setShowModal(true);
   }
 
   async function handleCreate() {
@@ -141,14 +185,20 @@ export default function SuperAdminPortal({ onBack }) {
     const finalPwd = passType === "auto" ? form.password : password;
     setCreating(true); setCreateErr("");
     try {
-      const res = await fetch("/superadmin/create-admin", {
+      const res = await saFetch("/superadmin/create-admin", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name: name.trim(), email: email.trim().toLowerCase(), password: finalPwd }),
       });
       const data = await res.json();
       if (!res.ok) { setCreateErr(data.error || "Failed to create admin."); }
-      else { setResult({ email: email.trim().toLowerCase(), password: finalPwd }); fetchAdmins(); }
+      else {
+        const finalEmail = email.trim().toLowerCase();
+        setResult({ email: finalEmail, password: finalPwd });
+        setSendTo(finalEmail);
+        setLinkSent(false); setLinkErr("");
+        fetchAdmins();
+      }
     } catch { setCreateErr("Network error — is the backend running?"); }
     setCreating(false);
   }
@@ -236,7 +286,9 @@ export default function SuperAdminPortal({ onBack }) {
               onKeyDown={e=>e.key==="Enter"&&handleLogin()} />
           </div>
           {loginErr && <div style={styles.errBox}>{loginErr}</div>}
-          <button style={styles.btnPrimary} onClick={handleLogin}>Sign In</button>
+          <button style={styles.btnPrimary} onClick={handleLogin} disabled={loginLoading}>
+            {loginLoading ? "Signing in…" : "Sign In"}
+          </button>
           <button style={styles.btnBack} onClick={onBack}>← Back to home</button>
         </div>
       </div>
@@ -549,7 +601,39 @@ export default function SuperAdminPortal({ onBack }) {
                     {copied === "pwd" ? "Copied!" : "Copy"}
                   </button>
                 </div>
-                <button style={{...styles.btnPrimary, width:"100%", marginTop:20}}
+
+                {/* ── Send Activation Link ── */}
+                <div style={{marginTop:20,background:"#f0f7ff",border:"1px solid #bfdbfe",borderRadius:12,padding:"16px 18px"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10}}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2563eb" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>
+                    </svg>
+                    <span style={{fontWeight:700,fontSize:13,color:"#1d4ed8"}}>Send Activation Link</span>
+                  </div>
+                  <p style={{margin:"0 0 12px",fontSize:12,color:"#3b82f6",lineHeight:1.5}}>
+                    Send the admin an email link to set their own password and configure MFA. The link expires in 7 days.
+                  </p>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                    <input
+                      type="email"
+                      placeholder="Send link to email…"
+                      value={sendTo}
+                      onChange={e => { setSendTo(e.target.value); setLinkSent(false); setLinkErr(""); }}
+                      style={{...styles.input,margin:0,flex:1,fontSize:13,padding:"8px 10px"}}
+                    />
+                    <button
+                      onClick={handleSendActivation}
+                      disabled={sendingLink || linkSent}
+                      style={{padding:"8px 16px",background: linkSent ? "#16a34a" : "linear-gradient(135deg,#2563eb,#1d4ed8)",color:"#fff",border:"none",borderRadius:8,fontWeight:700,fontSize:13,cursor:sendingLink||linkSent?"default":"pointer",whiteSpace:"nowrap",fontFamily:"inherit",opacity:sendingLink?0.7:1}}
+                    >
+                      {sendingLink ? "Sending…" : linkSent ? "✓ Sent!" : "Send Link"}
+                    </button>
+                  </div>
+                  {linkErr && <div style={{marginTop:8,fontSize:12,color:"#dc2626"}}>{linkErr}</div>}
+                  {linkSent && <div style={{marginTop:8,fontSize:12,color:"#16a34a",fontWeight:600}}>✓ Activation link sent to {sendTo}</div>}
+                </div>
+
+                <button style={{...styles.btnPrimary, width:"100%", marginTop:16}}
                   onClick={() => { setResult(null); openModal(); }}>
                   Create Another
                 </button>

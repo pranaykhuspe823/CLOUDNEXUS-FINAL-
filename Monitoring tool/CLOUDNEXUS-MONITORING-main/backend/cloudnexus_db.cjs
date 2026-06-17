@@ -119,8 +119,51 @@ async function initDB() {
     }
   } catch (e) { console.log('[DB] cloud_sessions migration:', e.message); }
 
+  // ── Cloud Accounts (multi-account-per-provider credential model) ──────────
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS cloud_accounts (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      org_admin       TEXT    NOT NULL,
+      provider        TEXT    NOT NULL CHECK(provider IN ('aws','gcp','azure')),
+      label           TEXT    NOT NULL,
+      credentials_enc TEXT    NOT NULL,
+      account_meta    TEXT,
+      status          TEXT    NOT NULL DEFAULT 'active',
+      created_at      TEXT    DEFAULT (datetime('now')),
+      created_by      TEXT    NOT NULL,
+      updated_at      TEXT    DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_cloud_accounts_org ON cloud_accounts(org_admin);
+
+    CREATE TABLE IF NOT EXISTS cloud_account_access (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id  INTEGER NOT NULL,
+      user_email  TEXT    NOT NULL,
+      granted_at  TEXT    DEFAULT (datetime('now')),
+      granted_by  TEXT,
+      UNIQUE(account_id, user_email)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cloud_account_access_user ON cloud_account_access(user_email);
+  `);
+
+  // ── Account activation tokens ─────────────────────────────────────────────
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS activation_tokens (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      email      TEXT    NOT NULL,
+      token      TEXT    UNIQUE NOT NULL,
+      expires_at TEXT    NOT NULL,
+      used_at    TEXT,
+      created_at TEXT    DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_activation_token ON activation_tokens(token);
+  `);
+
   // ── Seed migration: promote existing self-registered users to admins ───────
   _runAdminSeedMigration();
+
+  // ── One-time migration: legacy single-account cloud_sessions → cloud_accounts ──
+  _migrateCloudSessionsToAccounts();
 
   _persist();
   console.log('[DB] SQLite initialized at', DB_PATH);
@@ -142,6 +185,37 @@ function _runAdminSeedMigration() {
     // Back-fill org_admin on their own logs
     _db.run("UPDATE logs SET org_admin=? WHERE user_email=? AND org_admin IS NULL", [u.email, u.email]);
   }
+}
+
+// Runs once: migrates legacy single-account-per-provider cloud_sessions rows
+// into the new multi-account cloud_accounts model, granting every existing
+// org user access so nobody loses a currently-working connection.
+function _migrateCloudSessionsToAccounts() {
+  const already = _rows(_db.exec('SELECT COUNT(*) as c FROM cloud_accounts'));
+  if (already.length && already[0].c > 0) return;
+  const sessions = _rows(_db.exec('SELECT * FROM cloud_sessions'));
+  if (!sessions.length) return;
+  for (const s of sessions) {
+    if (!s.org_admin) continue;
+    const label = `${String(s.provider).toUpperCase()} Account (migrated)`;
+    _db.run(
+      `INSERT INTO cloud_accounts (org_admin, provider, label, credentials_enc, status, created_by)
+       VALUES (?,?,?,?, 'active', ?)`,
+      [s.org_admin, s.provider, label, s.credentials_enc, s.org_admin]
+    );
+    const accountId = _db.exec('SELECT last_insert_rowid() as id')[0].values[0][0];
+    const orgUsers = getOrgUsers(s.org_admin);
+    const emails = new Set([s.org_admin, ...orgUsers.map(u => u.email)]);
+    for (const email of emails) {
+      try {
+        _db.run(
+          'INSERT OR IGNORE INTO cloud_account_access (account_id, user_email, granted_by) VALUES (?,?,?)',
+          [accountId, (email || '').toLowerCase().trim(), s.org_admin]
+        );
+      } catch {}
+    }
+  }
+  console.log(`[DB] Migrated ${sessions.length} cloud_sessions row(s) into cloud_accounts`);
 }
 
 function getDB() { return _db; }
@@ -301,6 +375,10 @@ function markMFAEnabled(email) {
   _db.run("UPDATE users SET mfa_enabled=1, last_login=? WHERE email=?", [new Date().toISOString(), email]);
   _scheduleSave();
 }
+function saveUserTOTPSecret(email, secret) {
+  _db.run("UPDATE users SET totp_secret=? WHERE LOWER(email)=LOWER(?)", [secret || null, email]);
+  _scheduleSave();
+}
 function updateLastLogin(email) {
   _db.run("UPDATE users SET last_login=? WHERE email=?", [new Date().toISOString(), email]);
   _scheduleSave();
@@ -410,7 +488,9 @@ function getLogs(limit = 200, tool = null) {
 
 // ── Cloud Sessions ──────────────────────────────────────────────────────────
 
-const SESSION_KEY = crypto.createHash('sha256').update('cloudnexus-session-key-2024').digest();
+const SESSION_KEY = process.env.ENCRYPTION_KEY
+  ? Buffer.from(process.env.ENCRYPTION_KEY, 'hex')
+  : crypto.createHash('sha256').update('cloudnexus-session-key-2024').digest();
 
 function encryptCreds(obj) {
   const iv     = crypto.randomBytes(16);
@@ -477,16 +557,198 @@ function getOrgAdminForUser(userEmail) {
   return ((user.org_admin || userEmail).toLowerCase().trim()) || null;
 }
 
+// ── Cloud Accounts (multi-account-per-provider, per-user ACL) ───────────────
+
+function createCloudAccount(orgAdmin, provider, label, creds, meta, createdBy) {
+  const org = (orgAdmin || '').toLowerCase().trim();
+  const enc = encryptCreds(creds);
+  _db.run(
+    `INSERT INTO cloud_accounts (org_admin, provider, label, credentials_enc, account_meta, created_by)
+     VALUES (?,?,?,?,?,?)`,
+    [org, provider, label, enc, meta ? JSON.stringify(meta) : null, createdBy]
+  );
+  const id = _db.exec('SELECT last_insert_rowid() as id')[0].values[0][0];
+  _persist();
+  return id;
+}
+
+function _accountRow(row) {
+  let meta = null;
+  try { meta = row.account_meta ? JSON.parse(row.account_meta) : null; } catch {}
+  return {
+    id: row.id,
+    orgAdmin: row.org_admin,
+    provider: row.provider,
+    label: row.label,
+    accountMeta: meta,
+    status: row.status,
+    createdAt: row.created_at,
+    createdBy: row.created_by,
+    updatedAt: row.updated_at,
+  };
+}
+
+function listCloudAccounts(orgAdmin) {
+  const org = (orgAdmin || '').toLowerCase().trim();
+  const rows = _rows(_db.exec('SELECT * FROM cloud_accounts WHERE org_admin=? ORDER BY created_at ASC', [org]));
+  return rows.map(row => {
+    const account = _accountRow(row);
+    const assigned = _rows(_db.exec(
+      `SELECT u.name as name, a.user_email as email FROM cloud_account_access a
+       LEFT JOIN users u ON LOWER(u.email)=LOWER(a.user_email)
+       WHERE a.account_id=?`,
+      [row.id]
+    ));
+    account.assignedUsers = assigned.map(u => ({ email: u.email, name: u.name || u.email }));
+    return account;
+  });
+}
+
+function getCloudAccount(accountId) {
+  const rows = _rows(_db.exec('SELECT * FROM cloud_accounts WHERE id=?', [accountId]));
+  if (!rows.length) return null;
+  const account = _accountRow(rows[0]);
+  try { account.credentials = decryptCreds(rows[0].credentials_enc); } catch { account.credentials = null; }
+  return account;
+}
+
+function updateCloudAccount(accountId, { label, creds, meta, status } = {}) {
+  const sets = [];
+  const params = [];
+  if (label !== undefined)  { sets.push('label=?');  params.push(label); }
+  if (creds !== undefined)  { sets.push('credentials_enc=?'); params.push(encryptCreds(creds)); }
+  if (meta !== undefined)   { sets.push('account_meta=?'); params.push(meta ? JSON.stringify(meta) : null); }
+  if (status !== undefined) { sets.push('status=?'); params.push(status); }
+  if (!sets.length) return;
+  sets.push("updated_at=datetime('now')");
+  params.push(accountId);
+  _db.run(`UPDATE cloud_accounts SET ${sets.join(', ')} WHERE id=?`, params);
+  _persist();
+}
+
+function deleteCloudAccount(accountId) {
+  _db.run('DELETE FROM cloud_account_access WHERE account_id=?', [accountId]);
+  _db.run('DELETE FROM cloud_accounts WHERE id=?', [accountId]);
+  _persist();
+}
+
+function grantAccountAccess(accountId, userEmail, grantedBy) {
+  const email = (userEmail || '').toLowerCase().trim();
+  if (!email) return;
+  _db.run(
+    'INSERT OR IGNORE INTO cloud_account_access (account_id, user_email, granted_by) VALUES (?,?,?)',
+    [accountId, email, grantedBy || null]
+  );
+  _persist();
+}
+
+function revokeAccountAccess(accountId, userEmail) {
+  const email = (userEmail || '').toLowerCase().trim();
+  _db.run('DELETE FROM cloud_account_access WHERE account_id=? AND LOWER(user_email)=?', [accountId, email]);
+  _persist();
+}
+
+function listAccountAssignments(accountId) {
+  const rows = _rows(_db.exec('SELECT user_email FROM cloud_account_access WHERE account_id=?', [accountId]));
+  return rows.map(r => r.user_email);
+}
+
+function listAccountsForUser(userEmail) {
+  const email = (userEmail || '').toLowerCase().trim();
+  const rows = _rows(_db.exec(
+    `SELECT ca.* FROM cloud_accounts ca
+     JOIN cloud_account_access a ON a.account_id=ca.id
+     WHERE LOWER(a.user_email)=? AND ca.status='active'
+     ORDER BY ca.created_at ASC`,
+    [email]
+  ));
+  return rows.map(_accountRow);
+}
+
+function isUserAssignedToAccount(userEmail, accountId) {
+  const email = (userEmail || '').toLowerCase().trim();
+  const rows = _rows(_db.exec(
+    'SELECT 1 as x FROM cloud_account_access WHERE account_id=? AND LOWER(user_email)=?',
+    [accountId, email]
+  ));
+  return rows.length > 0;
+}
+
+function listAllActiveCloudAccounts() {
+  const rows = _rows(_db.exec("SELECT * FROM cloud_accounts WHERE status='active'"));
+  return rows.map(_accountRow);
+}
+
+// Batched per-org lookup for the Users-tab logo badges: for every user in
+// the org, which accounts (id/provider/label) are they assigned to.
+function listOrgUserAccountAccess(orgAdmin) {
+  const org = (orgAdmin || '').toLowerCase().trim();
+  const rows = _rows(_db.exec(
+    `SELECT a.user_email as email, ca.id as id, ca.provider as provider, ca.label as label
+     FROM cloud_account_access a
+     JOIN cloud_accounts ca ON ca.id=a.account_id
+     WHERE ca.org_admin=?`,
+    [org]
+  ));
+  const byUser = {};
+  for (const r of rows) {
+    const email = (r.email || '').toLowerCase().trim();
+    if (!byUser[email]) byUser[email] = [];
+    byUser[email].push({ id: r.id, provider: r.provider, label: r.label });
+  }
+  return byUser;
+}
+
+// ── Activation Tokens ─────────────────────────────────────────────────────
+
+function createActivationToken(email) {
+  const e     = (email || '').toLowerCase().trim();
+  const token = crypto.randomBytes(32).toString('hex');
+  const exp   = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
+  _db.run('DELETE FROM activation_tokens WHERE LOWER(email)=?', [e]);
+  _db.run('INSERT INTO activation_tokens (email, token, expires_at) VALUES (?,?,?)', [e, token, exp]);
+  _scheduleSave();
+  return token;
+}
+
+function getActivationToken(token) {
+  const rows = _rows(_db.exec(
+    "SELECT * FROM activation_tokens WHERE token=? AND used_at IS NULL AND expires_at > datetime('now')",
+    [token]
+  ));
+  return rows[0] || null;
+}
+
+function consumeActivationToken(token) {
+  _db.run("UPDATE activation_tokens SET used_at=datetime('now') WHERE token=?", [token]);
+  _scheduleSave();
+}
+
+async function activateUser(email, plainPassword, totpSecret) {
+  const e    = (email || '').toLowerCase().trim();
+  const hash = await bcrypt.hash(plainPassword, 12);
+  _db.run(
+    'UPDATE users SET password_hash=?, totp_secret=?, mfa_enabled=1 WHERE LOWER(email)=?',
+    [hash, totpSecret, e]
+  );
+  _scheduleSave();
+}
+
 module.exports = {
   initDB, getDB,
   createUser, findUser, getUserByEmail, getAllUsers,
   getOrgUsers, deleteOrgUser, deleteUser, updateUserTools,
   getDeletedOrgUsers, restoreOrgUser, purgeExpiredDeletedUsers,
   syncOrgUsers, getAllOrgs,
-  markMFAEnabled, updateLastLogin,
+  markMFAEnabled, saveUserTOTPSecret, updateLastLogin,
   savePhoto, getPhoto,
   updateAdminPlan, cancelAdminPlan, pauseAdminPlan, resumeAdminPlan, getAdminData,
   addLog, getLogs, getOrgLogs,
   saveCloudSession, loadCloudSessions, loadAllCloudSessions, deleteCloudSession,
   getOrgAdminForUser,
+  createCloudAccount, listCloudAccounts, getCloudAccount, updateCloudAccount, deleteCloudAccount,
+  grantAccountAccess, revokeAccountAccess, listAccountAssignments,
+  listAccountsForUser, isUserAssignedToAccount, listAllActiveCloudAccounts,
+  listOrgUserAccountAccess,
+  createActivationToken, getActivationToken, consumeActivationToken, activateUser,
 };

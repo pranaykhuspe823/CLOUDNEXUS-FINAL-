@@ -96,12 +96,6 @@ export default function AuthPage({ onLogin, onBack }) {
     if (!email || !password) { showAlert("red", "Enter your email and password."); return; }
     setAlert(null);
 
-    // Admin hard-coded credentials (no MFA for admin)
-    if (email.toLowerCase() === "admin@core5.co.in" && password === "admin123") {
-      onLogin({ name: "Administrator", email: "admin@core5.co.in", isAdmin: true });
-      return;
-    }
-
     // Always try the backend first — it has the authoritative role, isAdmin, and orgAdmin values.
     // This ensures co-admins and promoted users are routed correctly.
     setLoading(true);
@@ -154,6 +148,12 @@ export default function AuthPage({ onLogin, onBack }) {
         return;
       }
       saveTOTPSecret(pendingUser.email, totpSecret);
+      // Persist secret to backend so server can verify on future logins
+      fetch(`${BACKEND}/auth/verify-mfa`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: pendingUser.email, totpSecret }),
+      }).catch(() => {});
       onLogin(pendingUser);
     } finally {
       setCodeLoading(false);

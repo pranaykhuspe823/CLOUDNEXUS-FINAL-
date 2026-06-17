@@ -66,65 +66,7 @@ function estimateMonthlyCost(resource) {
   return familyCosts[family] || 40;
 }
 
-// credentialStore
-// utils/credentialStore.js
-// In-memory encrypted credential store (use a proper secrets manager in production)
 const crypto = require('crypto');
-
-const store = new Map();
-const ALGORITHM = 'aes-256-gcm';
-
-// Simple session-based key (in prod, use HSM / KMS)
-const SESSION_KEY = crypto.randomBytes(32);
-
-function encrypt(text) {
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv(ALGORITHM, SESSION_KEY, iv);
-  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  return iv.toString('hex') + ':' + authTag.toString('hex') + ':' + encrypted.toString('hex');
-}
-
-function decrypt(data) {
-  const [ivHex, authTagHex, encryptedHex] = data.split(':');
-  const iv = Buffer.from(ivHex, 'hex');
-  const authTag = Buffer.from(authTagHex, 'hex');
-  const encrypted = Buffer.from(encryptedHex, 'hex');
-  const decipher = crypto.createDecipheriv(ALGORITHM, SESSION_KEY, iv);
-  decipher.setAuthTag(authTag);
-  return decipher.update(encrypted) + decipher.final('utf8');
-}
-
-const credentialStore = {
-  // key format: "${orgAdmin}::${provider}"
-  set(orgAdmin, provider, creds) {
-    const encrypted = encrypt(JSON.stringify(creds));
-    store.set(`${orgAdmin}::${provider}`, encrypted);
-  },
-  get(orgAdmin, provider) {
-    const enc = store.get(`${orgAdmin}::${provider}`);
-    if (!enc) return null;
-    try { return JSON.parse(decrypt(enc)); } catch { return null; }
-  },
-  delete(orgAdmin, provider) {
-    store.delete(`${orgAdmin}::${provider}`);
-  },
-  has(orgAdmin, provider) {
-    return store.has(`${orgAdmin}::${provider}`);
-  },
-  listProviders(orgAdmin) {
-    const prefix = `${orgAdmin}::`;
-    return Array.from(store.keys())
-      .filter(k => k.startsWith(prefix))
-      .map(k => k.slice(prefix.length));
-  },
-  listAllOrgProviders() {
-    return Array.from(store.keys()).map(k => {
-      const idx = k.indexOf('::');
-      return { orgAdmin: k.slice(0, idx), provider: k.slice(idx + 2) };
-    });
-  },
-};
 
 // alertService
 // services/alertService.js
@@ -3805,7 +3747,7 @@ class ReportService {
       port: SMTP_PORT,
       secure: SMTP_PORT === 465,
       auth: { type: 'LOGIN', user: SMTP_USER, pass: SMTP_PASS },
-      tls: { rejectUnauthorized: false },
+      tls: { rejectUnauthorized: true },
       debug: true,
       logger: true,
     });
@@ -3856,69 +3798,42 @@ class ReportService {
   }
 
   async sendReport(email) {
-    // Resolve org scope for this user
-    let orgAdmin = email ? resolveOrgAdmin(email) : '';
-    // Fallback: if DB lookup fails or user isn't in users table yet, use the email itself as the org key
-    if (!orgAdmin) orgAdmin = (email || '').toLowerCase().trim();
+    // Accounts this email can see: the org admin's full org, or just their assignments.
+    const accounts = getAccessibleAccounts(email);
 
-    logger.info(`[ReportService] sendReport → email=${email} orgAdmin=${orgAdmin}`);
-
-    const orgCache = getOrgCache(orgAdmin);
+    logger.info(`[ReportService] sendReport → email=${email} accounts=${accounts.map(a => a.id).join(',')}`);
 
     // If a startup/background fetch is already in progress, wait for it to complete (up to 40s)
     const waitStart = Date.now();
     while (Date.now() - waitStart < 40000) {
-      const anyFetching = ['aws', 'gcp', 'azure'].some(p => orgCache[p]?.fetching);
+      const anyFetching = accounts.some(a => getAccountCache(a.id).fetching);
       if (!anyFetching) break;
       await new Promise(r => setTimeout(r, 800));
     }
 
-    const totalCached = (orgCache.aws?.resources?.length || 0)
-                      + (orgCache.gcp?.resources?.length || 0)
-                      + (orgCache.azure?.resources?.length || 0);
+    const totalCached = accounts.reduce((sum, a) => sum + getAccountCache(a.id).resources.length, 0);
 
-    logger.info(`[ReportService] cache state → aws=${orgCache.aws?.resources?.length||0} gcp=${orgCache.gcp?.resources?.length||0} azure=${orgCache.azure?.resources?.length||0}`);
-
-    if (totalCached === 0) {
-      // Nothing in cache even after waiting — ensure credential store is loaded from DB
-      let toFetch = ['aws', 'gcp', 'azure'].filter(p => credentialStore.has(orgAdmin, p));
-
-      if (toFetch.length === 0) {
-        logger.info(`[ReportService] credential store empty for ${orgAdmin}, reloading from DB`);
-        try {
-          const dbSessions = db.loadAllCloudSessions('monitoring');
-          for (const s of dbSessions) {
-            const oa = (s.org_admin || '').toLowerCase().trim();
-            if (oa === orgAdmin && s.credentials && !credentialStore.has(oa, s.provider)) {
-              credentialStore.set(oa, s.provider, s.credentials);
-              logger.info(`[ReportService] reloaded ${s.provider} creds for ${oa} from DB`);
-            }
-          }
-        } catch (e) {
-          logger.error(`[ReportService] DB session reload failed: ${e.message}`);
-        }
-        toFetch = ['aws', 'gcp', 'azure'].filter(p => credentialStore.has(orgAdmin, p));
-      }
-
-      if (toFetch.length > 0) {
-        logger.info(`[ReportService] fetching fresh data for providers: ${toFetch.join(', ')}`);
-        try {
-          await Promise.all(toFetch.map(p => fetchProvider(p, orgAdmin)));
-        } catch (e) {
-          logger.error(`[ReportService] pre-send fetch failed: ${e.message}`);
-        }
-      } else {
-        logger.warn(`[ReportService] no credentials found for orgAdmin=${orgAdmin} — report will show empty data`);
+    if (accounts.length === 0) {
+      logger.warn(`[ReportService] no accessible cloud accounts for ${email} — report will show empty data`);
+    } else if (totalCached === 0) {
+      logger.info(`[ReportService] no cached data for ${email}, fetching fresh for ${accounts.length} account(s)`);
+      try {
+        await Promise.all(accounts.map(a => fetchAccount(a.id)));
+      } catch (e) {
+        logger.error(`[ReportService] pre-send fetch failed: ${e.message}`);
       }
     }
 
-    // Re-read cache after fetch (same object ref — fetchProvider mutates it in place)
-    const cache    = getOrgCache(orgAdmin);
-    const alerts   = cache.alerts    || [];
-    const awsRes   = cache.aws?.resources   || [];
-    const gcpRes   = cache.gcp?.resources   || [];
-    const azureRes = cache.azure?.resources || [];
-    const all      = [...awsRes, ...gcpRes, ...azureRes];
+    const awsRes = [], gcpRes = [], azureRes = [];
+    let alerts = [];
+    for (const a of accounts) {
+      const cache = getAccountCache(a.id);
+      if (a.provider === 'aws') awsRes.push(...cache.resources);
+      else if (a.provider === 'gcp') gcpRes.push(...cache.resources);
+      else if (a.provider === 'azure') azureRes.push(...cache.resources);
+      alerts.push(...cache.alerts);
+    }
+    const all = [...awsRes, ...gcpRes, ...azureRes];
 
     logger.info(`[ReportService] sending report → resources aws=${awsRes.length} gcp=${gcpRes.length} azure=${azureRes.length} alerts=${alerts.length}`);
 
@@ -4539,6 +4454,7 @@ const { Server: SocketServer } = require('socket.io');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
 const winston = require('winston');
 const db = require('./cloudnexus_db.cjs');
 
@@ -4577,24 +4493,27 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json({ limit: '5mb' }));
 app.use(rateLimit({ windowMs: 60000, max: 200, message: 'Too many requests' }));
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: 'Too many login attempts. Please try again later.', standardHeaders: true, legacyHeaders: false });
 
 // â”€â”€â”€ In-memory cache â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// ─── Per-org in-memory caches ──────────────────────────────────────────────────────────────────────────────────────────────
-const orgCaches = new Map(); // orgAdmin → { aws, gcp, azure, alerts, alertService, topology }
+// ─── Per-account in-memory caches ─────────────────────────────────────────
+// One cloud_accounts row = one org + one provider + one credential set, so a
+// cache entry only ever holds a single provider's data.
+const accountCaches = new Map(); // accountId → { resources, lastFetch, fetching, alerts, alertService, topology }
 
-function getOrgCache(orgAdmin) {
-  const key = (orgAdmin || '').toLowerCase().trim();
-  if (!orgCaches.has(key)) {
-    orgCaches.set(key, {
-      aws:          { resources: [], lastFetch: null, fetching: false },
-      gcp:          { resources: [], lastFetch: null, fetching: false },
-      azure:        { resources: [], lastFetch: null, fetching: false },
+function getAccountCache(accountId) {
+  const key = String(accountId);
+  if (!accountCaches.has(key)) {
+    accountCaches.set(key, {
+      resources:    [],
+      lastFetch:    null,
+      fetching:     false,
       alerts:       [],
       alertService: new AlertService(),
       topology:     null,
     });
   }
-  return orgCaches.get(key);
+  return accountCaches.get(key);
 }
 
 function resolveOrgAdmin(userEmail) {
@@ -4602,44 +4521,50 @@ function resolveOrgAdmin(userEmail) {
   try { return db.getOrgAdminForUser(userEmail) || ''; } catch { return ''; }
 }
 
-const reportService = new ReportService();
-reportService.setCache((email) => {
-  const orgAdmin = email ? resolveOrgAdmin(email) : '';
-  return getOrgCache(orgAdmin);
-});
-reportService.restoreFromFile();
-
-// â”€â”€â”€ Helper: build topology from resources â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-function buildTopology(orgCache) {
-  return {
-    aws: orgCache.aws.resources.map(r => ({
-      id: r.id, label: r.name, type: r.type, family: r.family,
-      provider: 'aws', region: r.region, health: r.health, connections: r.connections,
-    })),
-    gcp: orgCache.gcp.resources.map(r => ({
-      id: r.id, label: r.name, type: r.type, family: r.family,
-      provider: 'gcp', region: r.region, health: r.health, connections: r.connections,
-    })),
-    azure: orgCache.azure.resources.map(r => ({
-      id: r.id, label: r.name, type: r.type, family: r.family,
-      provider: 'azure', region: r.region, health: r.health, connections: r.connections,
-    })),
-  };
+// Accounts a uid may access: the org admin sees every active account in
+// their org; everyone else sees only accounts they've been explicitly assigned to.
+function getAccessibleAccounts(uid) {
+  const email = (uid || '').toLowerCase().trim();
+  if (!email) return [];
+  const orgAdmin = resolveOrgAdmin(email);
+  if (orgAdmin && orgAdmin === email) {
+    try { return db.listCloudAccounts(orgAdmin).filter(a => a.status === 'active'); } catch { return []; }
+  }
+  try { return db.listAccountsForUser(email); } catch { return []; }
 }
 
-// â”€â”€â”€ Fetch resources for a provider â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-async function fetchProvider(provider, orgAdmin) {
-  const oa = (orgAdmin || '').toLowerCase().trim();
-  if (!credentialStore.has(oa, provider)) return;
-  const creds = credentialStore.get(oa, provider);
-  if (!creds) return;
+function hasAccountAccess(uid, account) {
+  if (!account) return false;
+  const email = (uid || '').toLowerCase().trim();
+  if (!email) return false;
+  const orgAdmin = resolveOrgAdmin(email);
+  if (orgAdmin && orgAdmin === email && account.orgAdmin === orgAdmin) return true;
+  try { return db.isUserAssignedToAccount(email, account.id); } catch { return false; }
+}
 
-  const orgCache = getOrgCache(oa);
-  const orgRoom  = `org:${oa}`;
+const reportService = new ReportService();
+reportService.restoreFromFile();
 
-  orgCache[provider].fetching = true;
-  io.to(orgRoom).emit('provider:fetching', { provider });
-  logger.info(`[${oa}] Fetching ${provider} resources...`);
+// â”€â”€â”€ Helper: build topology from a single account's resources â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function buildAccountTopology(resources, provider) {
+  return resources.map(r => ({
+    id: r.id, label: r.name, type: r.type, family: r.family,
+    provider, region: r.region, health: r.health, connections: r.connections,
+  }));
+}
+
+// â”€â”€â”€ Fetch resources for one cloud account â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function fetchAccount(accountId) {
+  const account = db.getCloudAccount(accountId);
+  if (!account || account.status !== 'active' || !account.credentials) return;
+  const { provider, credentials: creds } = account;
+
+  const cache = getAccountCache(accountId);
+  const room  = `account:${accountId}`;
+
+  cache.fetching = true;
+  io.to(room).emit('provider:fetching', { provider, accountId: account.id });
+  logger.info(`[account:${accountId}] Fetching ${provider} resources (${account.label})...`);
 
   try {
     let resources = [];
@@ -4659,30 +4584,34 @@ async function fetchProvider(provider, orgAdmin) {
       providerAlerts = await svc.getAlerts();
     }
 
-    orgCache[provider].resources = resources;
-    orgCache[provider].lastFetch = new Date().toISOString();
-    orgCache[provider].fetching  = false;
+    resources = resources.map(r => ({ ...r, provider, accountId: account.id, accountLabel: account.label }));
+    providerAlerts = providerAlerts.map(a => ({ ...a, provider, accountId: account.id, accountLabel: account.label }));
 
-    const alertSvc = orgCache.alertService;
+    cache.resources = resources;
+    cache.lastFetch  = new Date().toISOString();
+    cache.fetching   = false;
+
+    const alertSvc = cache.alertService;
     alertSvc.addProviderAlerts(providerAlerts);
     alertSvc.generateFromResources(resources);
-    orgCache.alerts   = alertSvc.getAll();
-    orgCache.topology = buildTopology(orgCache);
+    cache.alerts   = alertSvc.getAll();
+    cache.topology = buildAccountTopology(resources, provider);
 
-    io.to(orgRoom).emit('provider:updated', {
+    io.to(room).emit('provider:updated', {
       provider,
+      accountId: account.id,
       resources,
       resourceCount: resources.length,
-      timestamp: orgCache[provider].lastFetch,
+      timestamp: cache.lastFetch,
     });
-    io.to(orgRoom).emit('alerts:updated', orgCache.alerts);
-    io.to(orgRoom).emit('topology:updated', orgCache.topology);
+    io.to(room).emit('alerts:updated', cache.alerts);
+    io.to(room).emit('topology:updated', cache.topology);
 
-    logger.info(`[${oa}] ${provider}: fetched ${resources.length} resources, ${providerAlerts.length} cloud alerts`);
+    logger.info(`[account:${accountId}] ${provider}: fetched ${resources.length} resources, ${providerAlerts.length} cloud alerts`);
   } catch (err) {
-    orgCache[provider].fetching = false;
-    logger.error(`[${oa}] ${provider} fetch error: ${err.message}`);
-    io.to(orgRoom).emit('provider:error', { provider, error: err.message });
+    cache.fetching = false;
+    logger.error(`[account:${accountId}] ${provider} fetch error: ${err.message}`);
+    io.to(room).emit('provider:error', { provider, accountId: account.id, error: err.message });
   }
 }
 
@@ -4713,6 +4642,27 @@ app.all('/billing/*', (req, res) => {
   pr.end();
 });
 
+// ── Admin-session gate for all sensitive /auth/* management routes ─────────
+// Verifies x-caller-email + x-session-id headers against activeSessions Map.
+// activeSessions is defined later in this file but initialized before any
+// request arrives, so this closure resolves it correctly at call time.
+function requireAdminSession(req, res, next) {
+  const callerEmail = (req.headers['x-caller-email'] || '').toLowerCase().trim();
+  const sessionId   = req.headers['x-session-id'] || '';
+  if (!callerEmail || !sessionId) {
+    return res.status(401).json({ error: 'missing_auth', message: 'Authentication required.' });
+  }
+  if (activeSessions.get(callerEmail) !== sessionId) {
+    return res.status(401).json({ error: 'invalid_session', message: 'Session expired or invalid. Please log in again.' });
+  }
+  const caller = db.getUserByEmail(callerEmail);
+  if (!caller || caller.deleted_at || caller.role !== 'admin') {
+    return res.status(403).json({ error: 'not_admin', message: 'Admin access required.' });
+  }
+  req.callerEmail = callerEmail;
+  next();
+}
+
 // ── Auth Routes (website login/register backed by SQLite) ─────────────────
 app.post('/auth/register', async (req, res) => {
   const { name, email, password, totpSecret } = req.body || {};
@@ -4723,36 +4673,47 @@ app.post('/auth/register', async (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
   const user = await db.findUser(email, password);
   if (!user) return res.status(401).json({ error: 'Invalid email or password' });
   if (user.deleted_at) return res.status(401).json({ error: 'Your account has been deleted. Contact your administrator to restore access.' });
+  const emailKey = email.toLowerCase().trim();
   // Successful login clears any stale revocation — re-created users must not be locked out
-  revokedSessions.delete(email.toLowerCase().trim());
+  revokedSessions.delete(emailKey);
   persistRevocations();
   const loginTime = new Date().toISOString();
   db.updateLastLogin(email);
   db.addLog(email, 'login', 'website', null, null);
   // Broadcast to admin portals so the Users table refreshes lastLogin instantly
   io.emit('user:login', { email: email.toLowerCase(), loginTime });
+
+  // Single-device enforcement: this login becomes the only valid session for
+  // this account — instantly force-logout whatever device was active before.
+  const sessionId = crypto.randomUUID();
+  activeSessions.set(emailKey, sessionId);
+  persistActiveSessions();
+  io.emit('session:revoked', { email: emailKey, sessionId, reason: 'kicked' });
+
   const isAdmin = user.role === 'admin';
   let tools = ['monitoring', 'billing'];
   try { tools = JSON.parse(user.tools || '["monitoring","billing"]'); } catch {}
   res.json({ success: true, user: {
     id: user.id, name: user.name, email: user.email,
-    totpSecret: user.totp_secret, mfaEnabled: !!user.mfa_enabled,
+    mfaEnabled: !!user.mfa_enabled,
     role: user.role || 'user',
     isAdmin,
     tools,
     orgAdmin: user.org_admin || null,  // non-null for promoted sub-admins
+    sessionId,
   }});
 });
 
 app.post('/auth/verify-mfa', (req, res) => {
-  const { email } = req.body || {};
+  const { email, totpSecret } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
+  if (totpSecret) db.saveUserTOTPSecret(email, totpSecret);
   db.markMFAEnabled(email);
   db.updateLastLogin(email);
   db.addLog(email, 'mfa_verified', 'website', null, null);
@@ -4767,7 +4728,7 @@ app.get('/auth/user/:email', (req, res) => {
 });
 
 // Returns org users scoped to admin, or all users if no admin param
-app.get('/auth/users', (req, res) => {
+app.get('/auth/users', requireAdminSession, (req, res) => {
   const admin = req.query.admin;
   const users = admin ? db.getOrgUsers(admin) : db.getAllUsers();
   res.json(users.map(u => ({
@@ -4779,8 +4740,40 @@ app.get('/auth/users', (req, res) => {
   })));
 });
 
+// Cascade-delete a single user's own activity when their account is removed.
+// Cloud accounts are owned by the org admin (see cloud_accounts/cloud_account_access)
+// and may be assigned to multiple teammates, so they are intentionally left untouched
+// here: wiping them would break monitoring/billing for the rest of the org, not just
+// the removed user. Only data that genuinely
+// belongs to this one user is cleared: their daily-report schedule (kept in both
+// the monitoring backend and the separate billing backend process) and their
+// activity log.
+function cascadeDeleteUserData(email) {
+  const target = (email || '').toLowerCase().trim();
+  if (!target) return;
+
+  for (const { email: schedEmail } of reportService.getAllSchedules()) {
+    if (schedEmail.toLowerCase().trim() === target) reportService.unschedule(schedEmail);
+  }
+
+  if (activityLog[target]) {
+    delete activityLog[target];
+    persistActivityLog();
+  }
+
+  // Billing tool runs as a separate process with its own report-schedule file —
+  // relay the same cleanup there via the existing billing-backend HTTP bridge.
+  const pr = http.request({
+    hostname: '127.0.0.1', port: 8001,
+    path: `/api/report/schedule/${encodeURIComponent(target)}`,
+    method: 'DELETE',
+  });
+  pr.on('error', () => {});
+  pr.end();
+}
+
 // Soft-delete org user — only if they belong to the calling admin's org
-app.delete('/auth/users/:email', (req, res) => {
+app.delete('/auth/users/:email', requireAdminSession, (req, res) => {
   const email      = decodeURIComponent(req.params.email);
   const adminEmail = req.query.admin;
   const deletedBy  = req.query.deletedBy || adminEmail;
@@ -4791,12 +4784,13 @@ app.delete('/auth/users/:email', (req, res) => {
   }
   revokedSessions.add(email.toLowerCase().trim());
   persistRevocations();
+  cascadeDeleteUserData(email);
   io.emit('session:revoked', { email: email.toLowerCase().trim() });
   res.json({ success: true });
 });
 
 // Get soft-deleted users still within the 7-day restore window
-app.get('/auth/deleted-users', (req, res) => {
+app.get('/auth/deleted-users', requireAdminSession, (req, res) => {
   const admin = req.query.admin;
   if (!admin) return res.status(400).json({ error: 'Missing admin param' });
   const users = db.getDeletedOrgUsers(admin);
@@ -4804,7 +4798,7 @@ app.get('/auth/deleted-users', (req, res) => {
 });
 
 // Restore a soft-deleted user so they can log in again
-app.post('/auth/restore-user', (req, res) => {
+app.post('/auth/restore-user', requireAdminSession, (req, res) => {
   const { email, adminEmail } = req.body || {};
   if (!email || !adminEmail) return res.status(400).json({ error: 'Missing fields' });
   db.restoreOrgUser(adminEmail, email);
@@ -4817,7 +4811,7 @@ app.post('/auth/restore-user', (req, res) => {
 });
 
 // Update tool access for an org user
-app.put('/auth/users/:email/tools', (req, res) => {
+app.put('/auth/users/:email/tools', requireAdminSession, (req, res) => {
   const email = decodeURIComponent(req.params.email);
   const { tools, admin } = req.body || {};
   if (!admin || !Array.isArray(tools)) return res.status(400).json({ error: 'Missing fields' });
@@ -4828,9 +4822,11 @@ app.put('/auth/users/:email/tools', (req, res) => {
 });
 
 // Register with org_admin so the user is scoped to that admin's org
-app.post('/auth/register-org-user', async (req, res) => {
+app.post('/auth/register-org-user', requireAdminSession, async (req, res) => {
   const { name, email, password, orgAdmin, tools } = req.body || {};
   if (!name || !email || !password || !orgAdmin) return res.status(400).json({ error: 'Missing fields' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  if (!/[A-Z]/.test(password) || !/[0-9]/.test(password)) return res.status(400).json({ error: 'Password must include at least one uppercase letter and one number.' });
   const result = await db.createUser(name, email, password, null, orgAdmin, tools || ['monitoring','billing'], 'user');
   if (result.error) return res.status(400).json(result);
   // Clear any prior revocation so a re-created user can log in
@@ -4841,7 +4837,7 @@ app.post('/auth/register-org-user', async (req, res) => {
 });
 
 // Promote an org user to sub-admin (shares org with primary admin)
-app.post('/auth/promote-user', (req, res) => {
+app.post('/auth/promote-user', requireAdminSession, (req, res) => {
   const { email, orgAdmin, maxSubAdmins } = req.body || {};
   if (!email || !orgAdmin) return res.status(400).json({ error: 'Missing fields' });
   const dbObj = db.getDB();
@@ -4861,7 +4857,7 @@ app.post('/auth/promote-user', (req, res) => {
 });
 
 // Demote a sub-admin back to regular user
-app.post('/auth/demote-user', (req, res) => {
+app.post('/auth/demote-user', requireAdminSession, (req, res) => {
   const { email, orgAdmin } = req.body || {};
   if (!email || !orgAdmin) return res.status(400).json({ error: 'Missing fields' });
   const dbObj = db.getDB();
@@ -4874,7 +4870,7 @@ app.post('/auth/demote-user', (req, res) => {
 });
 
 // Photo — save and retrieve
-app.post('/auth/photo', (req, res) => {
+app.post('/auth/photo', requireAdminSession, (req, res) => {
   const { email, photo } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
   db.savePhoto(email, photo || null);
@@ -4886,7 +4882,7 @@ app.get('/auth/photo/:email', (req, res) => {
 });
 
 // Subscription plan
-app.put('/auth/plan', (req, res) => {
+app.put('/auth/plan', requireAdminSession, (req, res) => {
   const { email, plan, purchasedAt } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
   db.updateAdminPlan(email, plan || null, purchasedAt || null);
@@ -4895,7 +4891,7 @@ app.put('/auth/plan', (req, res) => {
 });
 
 // Admin data (plan + photo)
-app.get('/auth/admin-data/:email', (req, res) => {
+app.get('/auth/admin-data/:email', requireAdminSession, (req, res) => {
   const data = db.getAdminData(decodeURIComponent(req.params.email));
   if (!data) return res.status(404).json({ error: 'Not found' });
   res.json({ name: data.name, email: data.email, plan: data.subscription_plan || null, planPurchasedAt: data.plan_purchased_at || null, planPausedAt: data.plan_paused_at || null, photo: data.photo || null });
@@ -4914,8 +4910,23 @@ app.post('/auth/sync-org', async (req, res) => {
 // Super Admin Portal — Core5 internal use only
 // ══════════════════════════════════════════════════════════════════════════
 
-const SA_EMAIL = 'core5@core5.co.in';
-const SA_PASS  = 'Core5@2022';
+const SA_EMAIL     = process.env.SA_EMAIL     || 'core5@core5.co.in';
+const SA_PASS_HASH = process.env.SA_PASS_HASH || '';
+
+// Super-admin session tokens (in-memory; cleared on restart, 8-hour TTL)
+const saSessions = new Map(); // token → createdAt
+
+function requireSA(req, res, next) {
+  const token = req.headers['x-sa-token'] || '';
+  if (!token || !saSessions.has(token)) {
+    return res.status(401).json({ error: 'Unauthorized. Please log in to the Super Admin portal.' });
+  }
+  if (Date.now() - saSessions.get(token) > 8 * 3600 * 1000) {
+    saSessions.delete(token);
+    return res.status(401).json({ error: 'Session expired. Please log in again.' });
+  }
+  next();
+}
 
 // ── Super-admin settings (persisted to disk) ─────────────────────────────────
 const _saFs   = require('fs');
@@ -4928,27 +4939,30 @@ function saveSaSettings() {
 }
 
 // Super-admin settings endpoints
-app.get('/superadmin/settings', (req, res) => {
+app.get('/superadmin/settings', requireSA, (req, res) => {
   res.json(saSettings);
 });
-app.put('/superadmin/settings', (req, res) => {
+app.put('/superadmin/settings', requireSA, (req, res) => {
   const patch = req.body || {};
   Object.assign(saSettings, patch);
   saveSaSettings();
   res.json({ success: true, settings: saSettings });
 });
 
-app.post('/superadmin/login', (req, res) => {
+app.post('/superadmin/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body || {};
-  if (email === SA_EMAIL && password === SA_PASS) {
-    res.json({ success: true, name: 'Core5 Admin' });
-  } else {
-    res.status(401).json({ error: 'Invalid credentials' });
+  if (!email || !password || email !== SA_EMAIL || !SA_PASS_HASH) {
+    return res.status(401).json({ error: 'Invalid credentials' });
   }
+  const valid = await bcrypt.compare(password, SA_PASS_HASH);
+  if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+  const token = crypto.randomUUID();
+  saSessions.set(token, Date.now());
+  res.json({ success: true, name: 'Core5 Admin', token });
 });
 
 // All admins with their org users and current plan
-app.get('/superadmin/admins', (req, res) => {
+app.get('/superadmin/admins', requireSA, (req, res) => {
   const orgs = db.getAllOrgs();
   const dbObj = db.getDB();
   const enriched = orgs.map(o => {
@@ -4988,7 +5002,7 @@ app.get('/superadmin/admins', (req, res) => {
 });
 
 // Create a new admin account and their org
-app.post('/superadmin/create-admin', async (req, res) => {
+app.post('/superadmin/create-admin', requireSA, async (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: 'name, email and password are required' });
 
@@ -5022,8 +5036,100 @@ app.post('/superadmin/create-admin', async (req, res) => {
   res.json({ success: true, email, name });
 });
 
+// ── Account Activation ────────────────────────────────────────────────────────
+
+// Send activation link email
+app.post('/superadmin/send-activation', requireSA, async (req, res) => {
+  const { adminEmail, sendTo } = req.body || {};
+  if (!adminEmail || !sendTo) return res.status(400).json({ error: 'adminEmail and sendTo are required' });
+
+  const user = db.getUserByEmail(adminEmail);
+  if (!user) return res.status(404).json({ error: 'Admin account not found' });
+
+  try {
+    const token = db.createActivationToken(adminEmail);
+    const frontendOrigin = (process.env.FRONTEND_URL
+      ? process.env.FRONTEND_URL.split(',')[0].trim()
+      : `http://localhost:3006`);
+    const activationUrl = `${frontendOrigin}/activate?token=${token}`;
+
+    const mailer = nodemailer.createTransport({
+      host: SMTP_HOST, port: SMTP_PORT, secure: SMTP_PORT === 465,
+      auth: { type: 'LOGIN', user: SMTP_USER, pass: SMTP_PASS },
+      tls: { rejectUnauthorized: true },
+    });
+
+    await mailer.sendMail({
+      from: SMTP_FROM,
+      to: sendTo,
+      subject: 'Activate your CloudNexus Admin Account',
+      html: `
+        <div style="font-family:Inter,Arial,sans-serif;max-width:560px;margin:0 auto;background:#ffffff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+          <div style="background:linear-gradient(135deg,#1e40af,#2563eb);padding:32px 40px;text-align:center">
+            <div style="width:52px;height:52px;background:rgba(255,255,255,0.15);border-radius:14px;display:inline-flex;align-items:center;justify-content:center;margin-bottom:16px">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+            </div>
+            <h1 style="margin:0;color:#fff;font-size:22px;font-weight:800;letter-spacing:-0.4px">Cloud<span style="color:#93c5fd">Nexus</span></h1>
+            <p style="margin:6px 0 0;color:rgba(255,255,255,0.75);font-size:13px">Admin Portal Activation</p>
+          </div>
+          <div style="padding:36px 40px">
+            <h2 style="margin:0 0 10px;font-size:20px;font-weight:800;color:#0f172a">Welcome, ${user.name || adminEmail}!</h2>
+            <p style="margin:0 0 24px;color:#64748b;font-size:15px;line-height:1.6">Your CloudNexus admin account has been created. Click the button below to activate your account, set your password, and configure two-factor authentication.</p>
+            <div style="text-align:center;margin:28px 0">
+              <a href="${activationUrl}" style="display:inline-block;background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff;font-size:15px;font-weight:700;padding:14px 36px;border-radius:10px;text-decoration:none;letter-spacing:0.1px">Activate My Account →</a>
+            </div>
+            <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:16px 20px;margin-top:24px">
+              <p style="margin:0 0 8px;font-size:12px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px">Account Details</p>
+              <p style="margin:0;font-size:14px;color:#0f172a"><strong>Email:</strong> ${adminEmail}</p>
+            </div>
+            <p style="margin:24px 0 0;color:#94a3b8;font-size:12px;line-height:1.6">This link expires in <strong>7 days</strong> and can only be used once. If you did not expect this email, please ignore it.</p>
+          </div>
+          <div style="padding:20px 40px;background:#f8fafc;border-top:1px solid #e2e8f0;text-align:center">
+            <p style="margin:0;color:#94a3b8;font-size:12px">© 2025 CloudNexus · Powered by Core5</p>
+          </div>
+        </div>
+      `,
+    });
+
+    db.addLog(adminEmail, 'activation_link_sent', 'website', null, { sentTo: sendTo }, null);
+    res.json({ success: true });
+  } catch (e) {
+    logger.error(`[activation] send error: ${e.message}`);
+    res.status(500).json({ error: 'Failed to send email: ' + e.message });
+  }
+});
+
+// Verify an activation token
+app.get('/activate/verify', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.json({ valid: false, reason: 'missing_token' });
+  const row = db.getActivationToken(token);
+  if (!row) return res.json({ valid: false, reason: 'invalid_or_expired' });
+  const user = db.getUserByEmail(row.email);
+  if (!user) return res.json({ valid: false, reason: 'user_not_found' });
+  res.json({ valid: true, email: row.email, name: user.name });
+});
+
+// Complete activation: set password + MFA, consume token
+app.post('/activate/complete', async (req, res) => {
+  const { token, password, totpSecret } = req.body || {};
+  if (!token || !password || !totpSecret) return res.status(400).json({ error: 'token, password and totpSecret are required' });
+  const row = db.getActivationToken(token);
+  if (!row) return res.status(400).json({ error: 'Invalid or expired activation token' });
+  try {
+    await db.activateUser(row.email, password, totpSecret);
+    db.consumeActivationToken(token);
+    const _fs = require('fs');
+    _fs.writeFileSync(_DB_PATH, Buffer.from(db.getDB().export()));
+    db.addLog(row.email, 'account_activated', 'website', null, null, null);
+    res.json({ success: true, email: row.email });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Cancel an admin's plan entirely
-app.delete('/superadmin/admins/:email/plan', (req, res) => {
+app.delete('/superadmin/admins/:email/plan', requireSA, (req, res) => {
   const email = decodeURIComponent(req.params.email);
   db.cancelAdminPlan(email);
   const _fs = require('fs'); const _p = require('path');
@@ -5035,7 +5141,7 @@ app.delete('/superadmin/admins/:email/plan', (req, res) => {
 });
 
 // Pause an admin's plan (timer freezes)
-app.post('/superadmin/admins/:email/plan/pause', (req, res) => {
+app.post('/superadmin/admins/:email/plan/pause', requireSA, (req, res) => {
   const email = decodeURIComponent(req.params.email);
   db.pauseAdminPlan(email);
   const _fs = require('fs'); const _p = require('path');
@@ -5046,7 +5152,7 @@ app.post('/superadmin/admins/:email/plan/pause', (req, res) => {
 });
 
 // Resume a paused plan (timer continues, no time lost)
-app.post('/superadmin/admins/:email/plan/resume', (req, res) => {
+app.post('/superadmin/admins/:email/plan/resume', requireSA, (req, res) => {
   const email = decodeURIComponent(req.params.email);
   db.resumeAdminPlan(email);
   const _fs = require('fs'); const _p = require('path');
@@ -5057,9 +5163,13 @@ app.post('/superadmin/admins/:email/plan/resume', (req, res) => {
 });
 
 // Delete an admin and all their users + logs from DB
-app.delete('/superadmin/admins/:email', (req, res) => {
+app.delete('/superadmin/admins/:email', requireSA, (req, res) => {
   const email  = decodeURIComponent(req.params.email);
   const dbObj  = db.getDB();
+
+  // Capture every email in this org before the rows disappear, so each
+  // member's own report schedule + activity log can be cleared too.
+  const orgEmails = [email, ...db.getOrgUsers(email).map(u => u.email)];
 
   // Delete all org users under this admin
   dbObj.run('DELETE FROM users WHERE org_admin=?', [email]);
@@ -5073,6 +5183,7 @@ app.delete('/superadmin/admins/:email', (req, res) => {
   // Revoke any active session
   revokedSessions.add(email.toLowerCase().trim());
   persistRevocations();
+  orgEmails.forEach(cascadeDeleteUserData);
   io.emit('session:revoked', { email: email.toLowerCase().trim() });
   io.emit('admin:deleted',   { email: email.toLowerCase().trim() });
 
@@ -5097,7 +5208,7 @@ app.post('/api/logs', (req, res) => {
 });
 
 // Health check
-app.get('/health', (_, res) => res.json({ status: 'ok', providers: credentialStore.listAllOrgProviders() }));
+app.get('/health', (_, res) => res.json({ status: 'ok', activeAccounts: db.listAllActiveCloudAccounts().length }));
 
 // ── Session Revocation ────────────────────────────────────────────────────────
 const _fs = require('fs');
@@ -5114,6 +5225,21 @@ function persistRevocations() {
   try { _fs.writeFileSync(REVOKE_FILE, JSON.stringify([...revokedSessions]), 'utf8'); } catch {}
 }
 
+// ── Single-device login enforcement ────────────────────────────────────────
+// Tracks the one currently-valid sessionId per email. Each successful login
+// overwrites the entry, instantly invalidating whatever device was logged in
+// before it (checked via socket push + the session-check poll below).
+const ACTIVE_SESSION_FILE = _path.join(__dirname, 'active_sessions.json');
+const activeSessions = new Map();
+try {
+  const stored = JSON.parse(_fs.readFileSync(ACTIVE_SESSION_FILE, 'utf8'));
+  if (stored && typeof stored === 'object') Object.entries(stored).forEach(([k, v]) => activeSessions.set(k, v));
+} catch {}
+
+function persistActiveSessions() {
+  try { _fs.writeFileSync(ACTIVE_SESSION_FILE, JSON.stringify(Object.fromEntries(activeSessions)), 'utf8'); } catch {}
+}
+
 app.post('/api/revoke-session', (req, res) => {
   const { email } = req.body || {};
   if (email) {
@@ -5127,6 +5253,7 @@ app.post('/api/revoke-session', (req, res) => {
 
 app.get('/api/session-check', (req, res) => {
   const email = (req.query.email || '').toLowerCase().trim();
+  const sessionId = (req.query.sessionId || '').trim();
   if (!email) return res.json({ valid: false });
   // Revoked sessions are always invalid — covers both soft-deleted and hard-deleted users.
   // revokedSessions is cleared on restore or re-creation, so re-created users are not blocked.
@@ -5135,6 +5262,11 @@ app.get('/api/session-check', (req, res) => {
   const user = db.getUserByEmail(email);
   if (!user) return res.json({ valid: false });
   if (user.deleted_at) return res.json({ valid: false });
+  // Single-device enforcement: a newer login elsewhere replaces this session
+  const currentSessionId = activeSessions.get(email);
+  if (sessionId && currentSessionId && currentSessionId !== sessionId) {
+    return res.json({ valid: false, reason: 'logged_in_elsewhere' });
+  }
   res.json({ valid: true });
 });
 
@@ -5165,88 +5297,229 @@ app.get('/api/activity/:email', (req, res) => {
 });
 
 // â”€â”€ Auth / Connections â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-app.post('/api/connect/:provider', async (req, res) => {
-  const { provider } = req.params;
-  if (!['aws', 'gcp', 'azure'].includes(provider)) return res.status(400).json({ error: 'Unknown provider' });
+function publicAccount(account) {
+  if (!account) return null;
+  const { credentials, ...pub } = account;
+  return pub;
+}
 
-  const { uid, ...creds } = req.body || {};
-  const orgAdmin = resolveOrgAdmin(uid);
-  if (!orgAdmin) return res.status(401).json({ error: 'Missing or invalid uid' });
-  if (!Object.keys(creds).length) return res.status(400).json({ error: 'No credentials' });
+// Strict admin-only gate: verifies the caller's own session (x-caller-email +
+// x-session-id) then checks they belong to the requested org scope (uid param).
+// Handles both primary admins (uid == caller) and co-admins (uid == their org).
+function requireOrgAdmin(req, res, next) {
+  const uid         = req.body?.uid || req.query.uid || '';
+  const callerEmail = (req.headers['x-caller-email'] || uid).toLowerCase().trim();
+  const sessionId   = req.headers['x-session-id'] || req.body?.sessionId || req.query.sessionId || '';
+
+  if (!uid || !sessionId || !callerEmail) {
+    return res.status(401).json({ error: 'missing_auth', message: 'Authentication required.' });
+  }
+  if (activeSessions.get(callerEmail) !== sessionId) {
+    return res.status(401).json({ error: 'invalid_session', message: 'Session expired or invalid. Please log in again.' });
+  }
+  const caller = db.getUserByEmail(callerEmail);
+  if (!caller || caller.deleted_at || caller.role !== 'admin') {
+    return res.status(403).json({ error: 'not_admin', message: 'Admin access required.' });
+  }
+  const callerOrg = resolveOrgAdmin(callerEmail);
+  if (callerOrg.toLowerCase() !== uid.toLowerCase()) {
+    return res.status(403).json({ error: 'wrong_org', message: 'Access denied to this organization.' });
+  }
+  req.orgAdmin    = callerOrg;
+  req.callerEmail = callerEmail;
+  next();
+}
+
+// Defense-in-depth gate for account-specific action routes (S3 details, CWAgent, etc).
+function requireAccountAccess(req, res, next) {
+  const uid       = req.body?.uid || req.query.uid || '';
+  const accountId = req.body?.accountId || req.query.accountId || req.params.accountId;
+  if (!uid) return res.status(401).json({ error: 'missing_uid', message: 'Missing or invalid uid.' });
+  if (!accountId) return res.status(400).json({ error: 'missing_account', message: 'accountId is required.' });
+  const account = db.getCloudAccount(accountId);
+  if (!account) return res.status(404).json({ error: 'not_found', message: 'Cloud account not found.' });
+  if (!hasAccountAccess(uid, account)) {
+    return res.status(403).json({ error: 'not_assigned', message: 'You do not have access to this cloud account.' });
+  }
+  req.cloudAccount = account;
+  next();
+}
+
+// For routes where accountId is an optional filter (default: all accessible accounts) —
+// if the caller does pass one, it must still be one they're actually assigned to.
+function checkAccountIdAccess(uid, accountId) {
+  if (!accountId) return null;
+  const account = db.getCloudAccount(accountId);
+  if (!account) return { status: 404, body: { error: 'not_found', message: 'Cloud account not found.' } };
+  if (!hasAccountAccess(uid, account)) {
+    return { status: 403, body: { error: 'not_assigned', message: 'You do not have access to this cloud account.' } };
+  }
+  return null;
+}
+
+async function verifyProviderCreds(provider, creds) {
+  if (provider === 'aws')   return new AWSService(creds).verifyConnection();
+  if (provider === 'gcp')   return new GCPService(creds).verifyConnection();
+  return new AzureService(creds).verifyConnection();
+}
+
+// ── Admin: Cloud Accounts CRUD + Assignment ─────────────────────────────
+app.get('/api/admin/cloud-accounts', requireOrgAdmin, (req, res) => {
+  res.json({ accounts: db.listCloudAccounts(req.orgAdmin) });
+});
+
+app.post('/api/admin/cloud-accounts', requireOrgAdmin, async (req, res) => {
+  const { provider, label, credentials, meta } = req.body || {};
+  if (!['aws', 'gcp', 'azure'].includes(provider)) return res.status(400).json({ error: 'Unknown provider' });
+  if (!label || !credentials) return res.status(400).json({ error: 'label and credentials are required' });
 
   try {
-    let result;
-    if (provider === 'aws') {
-      const svc = new AWSService(creds);
-      result = await svc.verifyConnection();
-    } else if (provider === 'gcp') {
-      const svc = new GCPService(creds);
-      result = await svc.verifyConnection();
-    } else {
-      const svc = new AzureService(creds);
-      result = await svc.verifyConnection();
-    }
+    const result = await verifyProviderCreds(provider, credentials);
+    if (!result.success) return res.status(401).json({ success: false, error: result.error });
 
-    if (!result.success) {
-      return res.status(401).json({ success: false, error: result.error });
-    }
+    const { success, ...identity } = result;
+    const accountMeta = { ...(meta || {}), ...identity };
+    const accountId = db.createCloudAccount(req.orgAdmin, provider, label, credentials, accountMeta, req.callerEmail);
+    db.grantAccountAccess(accountId, req.orgAdmin, req.callerEmail);
+    db.addLog(req.callerEmail, `create_cloud_account_${provider}`, 'monitoring', provider, { accountId, label }, req.orgAdmin);
 
-    credentialStore.set(orgAdmin, provider, creds);
-    db.saveCloudSession('monitoring', provider, orgAdmin, creds);
-    db.addLog(uid, `connect_${provider}`, 'monitoring', provider, result, orgAdmin);
+    fetchAccount(accountId).catch(e => logger.error(`Background fetch error: ${e.message}`));
 
-    fetchProvider(provider, orgAdmin).catch(e => logger.error(`Background fetch error: ${e.message}`));
-
-    res.json({ success: true, ...result });
+    res.json({ success: true, account: publicAccount(db.getCloudAccount(accountId)) });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-app.delete('/api/connect/:provider', (req, res) => {
-  const { provider } = req.params;
-  const uid      = req.query.uid || (req.body && req.body.uid) || '';
-  const orgAdmin = resolveOrgAdmin(uid);
-  if (!orgAdmin) return res.status(401).json({ error: 'Missing or invalid uid' });
+app.put('/api/admin/cloud-accounts/:accountId', requireOrgAdmin, async (req, res) => {
+  const account = db.getCloudAccount(req.params.accountId);
+  if (!account || account.orgAdmin !== req.orgAdmin) return res.status(404).json({ error: 'not_found' });
 
-  credentialStore.delete(orgAdmin, provider);
-  db.deleteCloudSession('monitoring', provider, orgAdmin);
-  db.addLog(uid, `disconnect_${provider}`, 'monitoring', provider, null, orgAdmin);
-  const orgCache = getOrgCache(orgAdmin);
-  orgCache[provider]    = { resources: [], lastFetch: null, fetching: false };
-  orgCache.alertService = new AlertService();
-  orgCache.alerts       = [];
-  io.to(`org:${orgAdmin}`).emit('provider:disconnected', { provider });
+  const { label, credentials, meta, status } = req.body || {};
+  let newMeta = meta;
+
+  if (credentials) {
+    try {
+      const result = await verifyProviderCreds(account.provider, credentials);
+      if (!result.success) return res.status(401).json({ success: false, error: result.error });
+      const { success, ...identity } = result;
+      newMeta = { ...(meta || account.accountMeta || {}), ...identity };
+    } catch (e) {
+      return res.status(500).json({ success: false, error: e.message });
+    }
+  }
+
+  db.updateCloudAccount(account.id, { label, creds: credentials, meta: newMeta, status });
+  db.addLog(req.callerEmail, 'update_cloud_account', 'monitoring', account.provider, { accountId: account.id }, req.orgAdmin);
+
+  if (credentials) {
+    accountCaches.delete(String(account.id));
+    fetchAccount(account.id).catch(e => logger.error(`Background fetch error: ${e.message}`));
+  }
+
+  res.json({ success: true, account: publicAccount(db.getCloudAccount(account.id)) });
+});
+
+app.delete('/api/admin/cloud-accounts/:accountId', requireOrgAdmin, (req, res) => {
+  const account = db.getCloudAccount(req.params.accountId);
+  if (!account || account.orgAdmin !== req.orgAdmin) return res.status(404).json({ error: 'not_found' });
+
+  db.deleteCloudAccount(account.id);
+  accountCaches.delete(String(account.id));
+  io.to(`account:${account.id}`).emit('account:deleted', { accountId: account.id });
+  db.addLog(req.callerEmail, 'delete_cloud_account', 'monitoring', account.provider, { accountId: account.id }, req.orgAdmin);
+
   res.json({ success: true });
 });
 
+app.post('/api/admin/cloud-accounts/:accountId/assign', requireOrgAdmin, (req, res) => {
+  const account = db.getCloudAccount(req.params.accountId);
+  if (!account || account.orgAdmin !== req.orgAdmin) return res.status(404).json({ error: 'not_found' });
+  const { userEmail } = req.body || {};
+  if (!userEmail) return res.status(400).json({ error: 'userEmail is required' });
+
+  db.grantAccountAccess(account.id, userEmail, req.callerEmail);
+  db.addLog(req.callerEmail, 'assign_cloud_account', 'monitoring', account.provider, { accountId: account.id, userEmail }, req.orgAdmin);
+
+  // Assignment = connection: warm the cache now so it's ready before the user opens the tool.
+  fetchAccount(account.id).catch(e => logger.error(`Background fetch error: ${e.message}`));
+
+  res.json({ success: true, account: publicAccount(db.getCloudAccount(account.id)) });
+});
+
+app.post('/api/admin/cloud-accounts/:accountId/unassign', requireOrgAdmin, (req, res) => {
+  const account = db.getCloudAccount(req.params.accountId);
+  if (!account || account.orgAdmin !== req.orgAdmin) return res.status(404).json({ error: 'not_found' });
+  const { userEmail } = req.body || {};
+  if (!userEmail) return res.status(400).json({ error: 'userEmail is required' });
+
+  db.revokeAccountAccess(account.id, userEmail);
+  db.addLog(req.callerEmail, 'unassign_cloud_account', 'monitoring', account.provider, { accountId: account.id, userEmail }, req.orgAdmin);
+
+  const target = userEmail.toLowerCase().trim();
+  for (const s of io.sockets.sockets.values()) {
+    if ((s.data?.uid || '').toLowerCase().trim() === target) s.leave(`account:${account.id}`);
+  }
+
+  res.json({ success: true, account: publicAccount(db.getCloudAccount(account.id)) });
+});
+
+app.get('/api/admin/users/account-access', requireOrgAdmin, (req, res) => {
+  res.json({ access: db.listOrgUserAccountAccess(req.orgAdmin) });
+});
+
+app.get('/api/admin/cloud-accounts/:accountId/credentials', requireOrgAdmin, (req, res) => {
+  const account = db.getCloudAccount(req.params.accountId);
+  if (!account || account.orgAdmin !== req.orgAdmin) return res.status(404).json({ error: 'not_found' });
+  db.addLog(req.callerEmail, 'view_cloud_credentials', 'monitoring', account.provider, { accountId: account.id }, req.orgAdmin);
+  res.json({ provider: account.provider, label: account.label, credentials: account.credentials || {} });
+});
+
+app.get('/api/accounts/mine', (req, res) => {
+  const uid = req.query.uid || '';
+  if (!uid) return res.status(401).json({ error: 'missing_uid', message: 'Missing or invalid uid.' });
+  const accounts = getAccessibleAccounts(uid).map(a => ({
+    id: a.id, provider: a.provider, label: a.label, accountMeta: a.accountMeta, status: a.status,
+  }));
+  res.json({ accounts });
+});
+
 app.get('/api/connections', (req, res) => {
-  const uid      = req.query.uid || '';
-  const orgAdmin = resolveOrgAdmin(uid);
-  if (!orgAdmin) return res.json({ aws: { connected: false }, gcp: { connected: false }, azure: { connected: false } });
-  const orgCache = getOrgCache(orgAdmin);
+  const accounts = getAccessibleAccounts(req.query.uid || '');
   const result = {};
   for (const p of ['aws', 'gcp', 'azure']) {
+    const provAccounts = accounts.filter(a => a.provider === p);
+    const caches = provAccounts.map(a => getAccountCache(a.id));
     result[p] = {
-      connected:     credentialStore.has(orgAdmin, p),
-      fetching:      orgCache[p]?.fetching || false,
-      resourceCount: orgCache[p]?.resources?.length || 0,
-      lastFetch:     orgCache[p]?.lastFetch || null,
+      connected:     provAccounts.length > 0,
+      fetching:      caches.some(c => c.fetching),
+      resourceCount: caches.reduce((sum, c) => sum + c.resources.length, 0),
+      lastFetch:     caches.reduce((max, c) => (!max || (c.lastFetch && c.lastFetch > max)) ? c.lastFetch : max, null),
+      accounts:      provAccounts.map(a => ({ id: a.id, label: a.label })),
     };
   }
   res.json(result);
 });
 
 // â”€â”€ Resources â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-app.get('/api/resources', (req, res) => {
-  const { provider, family, region, health, search, uid } = req.query;
-  const orgAdmin  = resolveOrgAdmin(uid);
-  const orgCache  = getOrgCache(orgAdmin);
+function mergeAccountResources(accounts) {
   let resources = [];
+  for (const a of accounts) {
+    resources = resources.concat(getAccountCache(a.id).resources);
+  }
+  return resources;
+}
 
-  if (!provider || provider === 'aws')   resources = resources.concat(orgCache.aws.resources);
-  if (!provider || provider === 'gcp')   resources = resources.concat(orgCache.gcp.resources);
-  if (!provider || provider === 'azure') resources = resources.concat(orgCache.azure.resources);
+app.get('/api/resources', (req, res) => {
+  const { provider, family, region, health, search, uid, accountId } = req.query;
+  const accessErr = checkAccountIdAccess(uid, accountId);
+  if (accessErr) return res.status(accessErr.status).json(accessErr.body);
+
+  let accounts = getAccessibleAccounts(uid);
+  if (accountId) accounts = accounts.filter(a => String(a.id) === String(accountId));
+  if (provider)  accounts = accounts.filter(a => a.provider === provider);
+
+  let resources = mergeAccountResources(accounts);
 
   if (family) resources = resources.filter(r => r.family === family);
   if (region) resources = resources.filter(r => r.region?.includes(region));
@@ -5266,35 +5539,52 @@ app.get('/api/resources', (req, res) => {
 app.get('/api/resources/:provider', (req, res) => {
   const { provider } = req.params;
   if (!['aws', 'gcp', 'azure'].includes(provider)) return res.status(400).json({ error: 'Unknown provider' });
-  const orgAdmin = resolveOrgAdmin(req.query.uid || '');
-  const orgCache = getOrgCache(orgAdmin);
+  const accounts = getAccessibleAccounts(req.query.uid || '').filter(a => a.provider === provider);
+  const caches = accounts.map(a => getAccountCache(a.id));
   res.json({
-    resources: orgCache[provider].resources,
-    lastFetch: orgCache[provider].lastFetch,
-    fetching: orgCache[provider].fetching,
+    resources: mergeAccountResources(accounts),
+    lastFetch: caches.reduce((max, c) => (!max || (c.lastFetch && c.lastFetch > max)) ? c.lastFetch : max, null),
+    fetching:  caches.some(c => c.fetching),
   });
 });
 
 app.post('/api/resources/refresh', async (req, res) => {
-  const { provider, uid } = req.body || {};
-  const orgAdmin  = resolveOrgAdmin(uid);
-  if (!orgAdmin) return res.status(401).json({ error: 'Missing or invalid uid' });
-  const providers = provider ? [provider] : credentialStore.listProviders(orgAdmin);
-  for (const p of providers) {
-    fetchProvider(p, orgAdmin).catch(e => logger.error(`Refresh error: ${e.message}`));
+  const { provider, uid, accountId } = req.body || {};
+  if (!uid) return res.status(401).json({ error: 'missing_uid', message: 'Missing or invalid uid.' });
+  const accessErr = checkAccountIdAccess(uid, accountId);
+  if (accessErr) return res.status(accessErr.status).json(accessErr.body);
+
+  let accounts = getAccessibleAccounts(uid);
+  if (accountId) accounts = accounts.filter(a => String(a.id) === String(accountId));
+  if (provider)  accounts = accounts.filter(a => a.provider === provider);
+  for (const a of accounts) {
+    fetchAccount(a.id).catch(e => logger.error(`Refresh error: ${e.message}`));
   }
-  res.json({ success: true, refreshing: providers });
+  res.json({ success: true, refreshing: accounts.map(a => a.id) });
 });
 
 // â”€â”€ Stats / Overview â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.get('/api/stats', (req, res) => {
-  const orgAdmin = resolveOrgAdmin(req.query.uid || '');
-  const orgCache = getOrgCache(orgAdmin);
-  const all = [...orgCache.aws.resources, ...orgCache.gcp.resources, ...orgCache.azure.resources];
+  const accounts = getAccessibleAccounts(req.query.uid || '');
+  const all = mergeAccountResources(accounts);
   const totalCost = all.reduce((a, r) => a + (r.cost || 0), 0);
   const regions   = new Set(all.map(r => r.region).filter(Boolean));
   const families  = {};
   for (const r of all) families[r.family] = (families[r.family] || 0) + 1;
+
+  const perProvider = {};
+  for (const p of ['aws', 'gcp', 'azure']) {
+    const provAccounts  = accounts.filter(a => a.provider === p);
+    const provResources = mergeAccountResources(provAccounts);
+    perProvider[p] = {
+      count: provResources.length,
+      cost:  Math.round(provResources.reduce((a, r) => a + (r.cost || 0), 0)),
+      lastFetch: provAccounts.reduce((max, a) => {
+        const lf = getAccountCache(a.id).lastFetch;
+        return (!max || (lf && lf > max)) ? lf : max;
+      }, null),
+    };
+  }
 
   res.json({
     totalServices:    all.length,
@@ -5304,36 +5594,58 @@ app.get('/api/stats', (req, res) => {
     totalCostMTD:     Math.round(totalCost),
     regions:          regions.size,
     familyBreakdown:  families,
-    perProvider: {
-      aws:   { count: orgCache.aws.resources.length,   cost: Math.round(orgCache.aws.resources.reduce((a, r) => a + (r.cost || 0), 0)),   lastFetch: orgCache.aws.lastFetch },
-      gcp:   { count: orgCache.gcp.resources.length,   cost: Math.round(orgCache.gcp.resources.reduce((a, r) => a + (r.cost || 0), 0)),   lastFetch: orgCache.gcp.lastFetch },
-      azure: { count: orgCache.azure.resources.length, cost: Math.round(orgCache.azure.resources.reduce((a, r) => a + (r.cost || 0), 0)), lastFetch: orgCache.azure.lastFetch },
-    },
+    perProvider,
   });
 });
 
 app.get('/api/alerts', (req, res) => {
-  const orgAdmin = resolveOrgAdmin(req.query.uid || '');
-  const orgCache = getOrgCache(orgAdmin);
-  res.json({ alerts: orgCache.alerts, stats: orgCache.alertService.getStats() });
+  const accounts = getAccessibleAccounts(req.query.uid || '');
+  let alerts = [];
+  const stats = { total: 0, critical: 0, warning: 0, unacknowledged: 0 };
+  for (const a of accounts) {
+    const cache = getAccountCache(a.id);
+    alerts = alerts.concat(cache.alerts);
+    const s = cache.alertService.getStats();
+    stats.total         += s.total;
+    stats.critical       += s.critical;
+    stats.warning        += s.warning;
+    stats.unacknowledged += s.unacknowledged;
+  }
+  res.json({ alerts, stats });
 });
 
 app.post('/api/alerts/:id/acknowledge', (req, res) => {
-  const { id }   = req.params;
-  const orgAdmin = resolveOrgAdmin(req.body?.uid || req.query.uid || '');
-  const orgCache = getOrgCache(orgAdmin);
-  const ok = orgCache.alertService.acknowledge(id);
-  orgCache.alerts = orgCache.alertService.getAll();
-  io.to(`org:${orgAdmin}`).emit('alerts:updated', orgCache.alerts);
+  const { id } = req.params;
+  const uid       = req.body?.uid || req.query.uid || '';
+  const accountId = req.body?.accountId;
+  const accessErr = checkAccountIdAccess(uid, accountId);
+  if (accessErr) return res.status(accessErr.status).json(accessErr.body);
+
+  let accounts = getAccessibleAccounts(uid);
+  if (accountId) accounts = accounts.filter(a => String(a.id) === String(accountId));
+
+  let ok = false;
+  for (const a of accounts) {
+    const cache = getAccountCache(a.id);
+    if (cache.alertService.acknowledge(id)) {
+      cache.alerts = cache.alertService.getAll();
+      io.to(`account:${a.id}`).emit('alerts:updated', cache.alerts);
+      ok = true;
+      break;
+    }
+  }
   res.json({ success: ok });
 });
 
 app.post('/api/alerts/acknowledge-all', (req, res) => {
-  const orgAdmin = resolveOrgAdmin(req.body?.uid || req.query.uid || '');
-  const orgCache = getOrgCache(orgAdmin);
-  for (const a of orgCache.alertService.getAll()) orgCache.alertService.acknowledge(a.id);
-  orgCache.alerts = orgCache.alertService.getAll();
-  io.to(`org:${orgAdmin}`).emit('alerts:updated', orgCache.alerts);
+  const uid = req.body?.uid || req.query.uid || '';
+  const accounts = getAccessibleAccounts(uid);
+  for (const a of accounts) {
+    const cache = getAccountCache(a.id);
+    for (const al of cache.alertService.getAll()) cache.alertService.acknowledge(al.id);
+    cache.alerts = cache.alertService.getAll();
+    io.to(`account:${a.id}`).emit('alerts:updated', cache.alerts);
+  }
   res.json({ success: true });
 });
 
@@ -5382,18 +5694,24 @@ app.post('/api/reports/send-now', async (req, res) => {
 
 // â”€â”€ Network Topology â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.get('/api/topology', (req, res) => {
-  const orgAdmin = resolveOrgAdmin(req.query.uid || '');
-  const orgCache = getOrgCache(orgAdmin);
-  if (!orgCache.topology) orgCache.topology = buildTopology(orgCache);
-  res.json(orgCache.topology);
+  const accounts = getAccessibleAccounts(req.query.uid || '');
+  const topology = { aws: [], gcp: [], azure: [] };
+  for (const a of accounts) {
+    const cache = getAccountCache(a.id);
+    const nodes = cache.topology || buildAccountTopology(cache.resources, a.provider);
+    topology[a.provider] = topology[a.provider].concat(nodes);
+  }
+  res.json(topology);
 });
 
 app.get('/api/metrics/resource/:id', (req, res) => {
-  const { id }   = req.params;
-  const orgAdmin = resolveOrgAdmin(req.query.uid || '');
-  const orgCache = getOrgCache(orgAdmin);
-  const all = [...orgCache.aws.resources, ...orgCache.gcp.resources, ...orgCache.azure.resources];
-  const resource = all.find(r => r.id === id);
+  const { id } = req.params;
+  const accounts = getAccessibleAccounts(req.query.uid || '');
+  let resource = null;
+  for (const a of accounts) {
+    resource = getAccountCache(a.id).resources.find(r => r.id === id);
+    if (resource) break;
+  }
   if (!resource) return res.status(404).json({ error: 'Resource not found' });
 
   // Return time-series style metrics (mocked if not real)
@@ -5410,15 +5728,13 @@ app.get('/api/metrics/resource/:id', (req, res) => {
 });
 
 // â”€â”€ CWAgent Installation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-function getAWSSvc(orgAdmin) {
-  const creds = credentialStore.get(orgAdmin || '', 'aws');
-  if (!creds) return null;
-  return new AWSService(creds);
+function getAWSSvc(account) {
+  if (!account || account.provider !== 'aws' || !account.credentials) return null;
+  return new AWSService(account.credentials);
 }
 
-app.get('/api/aws/s3-details/:bucket', async (req, res) => {
-  const orgAdmin = resolveOrgAdmin(req.query.uid || '');
-  const svc = getAWSSvc(orgAdmin);
+app.get('/api/aws/s3-details/:bucket', requireAccountAccess, async (req, res) => {
+  const svc = getAWSSvc(req.cloudAccount);
   if (!svc) return res.status(400).json({ error: 'AWS not connected' });
   try {
     const details = await svc.getS3BucketDetails(req.params.bucket);
@@ -5428,11 +5744,10 @@ app.get('/api/aws/s3-details/:bucket', async (req, res) => {
   }
 });
 
-app.post('/api/aws/install-cwagent', async (req, res) => {
-  const { instanceId, region, uid } = req.body;
+app.post('/api/aws/install-cwagent', requireAccountAccess, async (req, res) => {
+  const { instanceId, region } = req.body;
   if (!instanceId || !region) return res.status(400).json({ error: 'instanceId and region required' });
-  const orgAdmin = resolveOrgAdmin(uid || '');
-  const svc = getAWSSvc(orgAdmin);
+  const svc = getAWSSvc(req.cloudAccount);
   if (!svc) return res.status(400).json({ error: 'AWS not connected' });
   try {
     const commandId = await svc.installCWAgent(instanceId, region);
@@ -5443,10 +5758,10 @@ app.post('/api/aws/install-cwagent', async (req, res) => {
   }
 });
 
-app.post('/api/aws/configure-cwagent', async (req, res) => {
+app.post('/api/aws/configure-cwagent', requireAccountAccess, async (req, res) => {
   const { instanceId, region, platform } = req.body;
   if (!instanceId || !region) return res.status(400).json({ error: 'instanceId and region required' });
-  const svc = getAWSSvc();
+  const svc = getAWSSvc(req.cloudAccount);
   if (!svc) return res.status(400).json({ error: 'AWS not connected' });
   try {
     const commandId = await svc.configureCWAgent(instanceId, region, platform);
@@ -5457,10 +5772,10 @@ app.post('/api/aws/configure-cwagent', async (req, res) => {
   }
 });
 
-app.get('/api/aws/cwagent-status', async (req, res) => {
+app.get('/api/aws/cwagent-status', requireAccountAccess, async (req, res) => {
   const { commandId, instanceId, region } = req.query;
   if (!commandId || !instanceId || !region) return res.status(400).json({ error: 'commandId, instanceId and region required' });
-  const svc = getAWSSvc();
+  const svc = getAWSSvc(req.cloudAccount);
   if (!svc) return res.status(400).json({ error: 'AWS not connected' });
   try {
     const result = await svc.getCWAgentCommandStatus(commandId, instanceId, region);
@@ -5668,44 +5983,63 @@ const onlineUsers = new Map(); // email -> { name, socketId, loginTime }
 io.on('connection', socket => {
   logger.info(`Client connected: ${socket.id}`);
 
-  // Resolve org from uid in socket query and join org room
+  // Resolve accessible accounts from uid in socket query and join one room per account
   const socketUid = (socket.handshake.query.uid || '').toLowerCase().trim();
-  const socketOrg = socketUid ? resolveOrgAdmin(socketUid) : '';
-  socket.data.orgAdmin = socketOrg;
-  if (socketOrg) socket.join(`org:${socketOrg}`);
+  socket.data.uid = socketUid;
+  const accounts = getAccessibleAccounts(socketUid);
+  accounts.forEach(a => socket.join(`account:${a.id}`));
 
-  // Send org-scoped initial state
-  const initCache = getOrgCache(socketOrg);
+  const byProvider = { aws: [], gcp: [], azure: [] };
+  for (const a of accounts) byProvider[a.provider].push(a);
+
+  function providerState(provAccounts) {
+    const caches = provAccounts.map(a => getAccountCache(a.id));
+    return {
+      resources: mergeAccountResources(provAccounts),
+      lastFetch: caches.reduce((max, c) => (!max || (c.lastFetch && c.lastFetch > max)) ? c.lastFetch : max, null),
+      fetching:  caches.some(c => c.fetching),
+    };
+  }
+
+  const aws   = providerState(byProvider.aws);
+  const gcp   = providerState(byProvider.gcp);
+  const azure = providerState(byProvider.azure);
+
+  const topology = { aws: [], gcp: [], azure: [] };
+  let alerts = [];
+  for (const a of accounts) {
+    const cache = getAccountCache(a.id);
+    topology[a.provider] = topology[a.provider].concat(cache.topology || buildAccountTopology(cache.resources, a.provider));
+    alerts = alerts.concat(cache.alerts);
+  }
+
   socket.emit('initial:state', {
-    aws:      { resources: initCache.aws.resources,   lastFetch: initCache.aws.lastFetch,   fetching: initCache.aws.fetching },
-    gcp:      { resources: initCache.gcp.resources,   lastFetch: initCache.gcp.lastFetch,   fetching: initCache.gcp.fetching },
-    azure:    { resources: initCache.azure.resources, lastFetch: initCache.azure.lastFetch, fetching: initCache.azure.fetching },
-    alerts:   initCache.alerts,
-    topology: initCache.topology || buildTopology(initCache),
+    aws, gcp, azure, alerts, topology,
     connections: {
-      aws:   { connected: credentialStore.has(socketOrg, 'aws'),   resourceCount: initCache.aws.resources.length },
-      gcp:   { connected: credentialStore.has(socketOrg, 'gcp'),   resourceCount: initCache.gcp.resources.length },
-      azure: { connected: credentialStore.has(socketOrg, 'azure'), resourceCount: initCache.azure.resources.length },
+      aws:   { connected: byProvider.aws.length   > 0, resourceCount: aws.resources.length },
+      gcp:   { connected: byProvider.gcp.length   > 0, resourceCount: gcp.resources.length },
+      azure: { connected: byProvider.azure.length > 0, resourceCount: azure.resources.length },
     },
   });
 
-  socket.on('refresh', ({ provider }) => {
-    const oa = socket.data.orgAdmin || '';
-    if (provider && ['aws', 'gcp', 'azure'].includes(provider)) {
-      fetchProvider(provider, oa).catch(e => logger.error(e.message));
-    } else {
-      credentialStore.listProviders(oa).forEach(p =>
-        fetchProvider(p, oa).catch(e => logger.error(e.message))
-      );
-    }
+  socket.on('refresh', ({ provider, accountId }) => {
+    let accs = getAccessibleAccounts(socket.data.uid);
+    if (accountId) accs = accs.filter(a => String(a.id) === String(accountId));
+    if (provider)  accs = accs.filter(a => a.provider === provider);
+    accs.forEach(a => fetchAccount(a.id).catch(e => logger.error(e.message)));
   });
 
-  socket.on('acknowledge', ({ alertId }) => {
-    const oa       = socket.data.orgAdmin || '';
-    const orgCache = getOrgCache(oa);
-    orgCache.alertService.acknowledge(alertId);
-    orgCache.alerts = orgCache.alertService.getAll();
-    io.to(`org:${oa}`).emit('alerts:updated', orgCache.alerts);
+  socket.on('acknowledge', ({ alertId, accountId }) => {
+    let accs = getAccessibleAccounts(socket.data.uid);
+    if (accountId) accs = accs.filter(a => String(a.id) === String(accountId));
+    for (const a of accs) {
+      const cache = getAccountCache(a.id);
+      if (cache.alertService.acknowledge(alertId)) {
+        cache.alerts = cache.alertService.getAll();
+        io.to(`account:${a.id}`).emit('alerts:updated', cache.alerts);
+        break;
+      }
+    }
   });
 
   socket.on('disconnect', () => {
@@ -5731,12 +6065,10 @@ io.on('connection', socket => {
 
 // â”€â”€â”€ Cron: auto-refresh every 5 minutes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 cron.schedule('*/5 * * * *', () => {
-  const allConnected = credentialStore.listAllOrgProviders();
-  if (allConnected.length > 0) {
-    logger.info(`Cron refresh: ${allConnected.map(x => `${x.orgAdmin}/${x.provider}`).join(', ')}`);
-    allConnected.forEach(({ orgAdmin, provider }) =>
-      fetchProvider(provider, orgAdmin).catch(e => logger.error(e.message))
-    );
+  const accounts = db.listAllActiveCloudAccounts();
+  if (accounts.length > 0) {
+    logger.info(`Cron refresh: ${accounts.map(a => `${a.orgAdmin}/${a.provider}/${a.id}`).join(', ')}`);
+    accounts.forEach(a => fetchAccount(a.id).catch(e => logger.error(e.message)));
   }
 });
 
@@ -5748,15 +6080,11 @@ db.initDB().then(() => {
   // Schedule daily purge at midnight
   cron.schedule('0 0 * * *', () => db.purgeExpiredDeletedUsers(), { timezone: 'Asia/Kolkata' });
 
-  // Restore persisted monitoring sessions (up to 48h) — scoped per org
-  const sessions = db.loadAllCloudSessions('monitoring');
-  for (const s of sessions) {
-    if (s.credentials) {
-      const oa = (s.org_admin || '').trim();
-      credentialStore.set(oa, s.provider, s.credentials);
-      logger.info(`Restored [${oa}] ${s.provider} session from DB (expires ${s.expires_at})`);
-      fetchProvider(s.provider, oa).catch(e => logger.error(`Session restore fetch: ${e.message}`));
-    }
+  // Warm up caches for every active cloud account on startup
+  const accounts = db.listAllActiveCloudAccounts();
+  for (const a of accounts) {
+    logger.info(`Restoring [${a.orgAdmin}] ${a.provider} account ${a.id} (${a.label})`);
+    fetchAccount(a.id).catch(e => logger.error(`Startup fetch: ${e.message}`));
   }
   // Serve built frontends in production (Railway)
   const _staticPath = require('path').join(__dirname, 'public');

@@ -20,7 +20,12 @@ export default defineConfig(({ command }) => ({
       '/api':         { target: 'http://localhost:3001', changeOrigin: true },
       '/auth':        { target: 'http://localhost:3001', changeOrigin: true },
       '/health':      { target: 'http://localhost:3001', changeOrigin: true },
-      '/superadmin':  { target: 'http://localhost:3001', changeOrigin: true },
+      // Only proxy actual API calls under /superadmin/...  — bare /superadmin
+      // is the SPA's own super-admin portal route (Ctrl+Shift+K), and must
+      // fall through to Vite's SPA fallback so a hard refresh doesn't 404.
+      '^/superadmin/.+': { target: 'http://localhost:3001', changeOrigin: true },
+      // Activation API sub-routes go to backend; bare /activate goes to SPA.
+      '^/activate/.+':   { target: 'http://localhost:3001', changeOrigin: true },
       '/socket.io':   { target: 'http://localhost:3001', ws: true, changeOrigin: true },
     },
   },

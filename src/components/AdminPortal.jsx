@@ -74,6 +74,20 @@ const RestoreIcon = () => (
     <path d="M3 3v5h5"/>
   </svg>
 );
+const CloudAccountNavIcon = () => (
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>
+    <path d="M12 15v3"/><path d="M10 17h4"/>
+  </svg>
+);
+const ProviderLogo = ({ provider, size = 20 }) => (
+  <img
+    src={`${import.meta.env.BASE_URL}logos/${provider}.svg`}
+    alt={provider}
+    style={{ width: size, height: size, objectFit: "contain", verticalAlign: "middle" }}
+    onError={e => { e.currentTarget.style.display = "none"; }}
+  />
+);
 
 /* ── Helpers ── */
 const USERS_KEY    = "cn_admin_users";
@@ -607,6 +621,18 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   // Promoted sub-admins use their orgAdmin as the org scope; primary admins use their own email
   const orgScope = admin?.orgAdmin || admin?.email;
 
+  // Attach session credentials to every protected backend call.
+  // x-caller-email identifies the actual logged-in user (needed for co-admin support).
+  // x-session-id is verified server-side against activeSessions.
+  const apiFetch = (url, opts = {}) => {
+    const headers = {
+      ...(opts.headers || {}),
+      'x-session-id':    admin?.sessionId   || '',
+      'x-caller-email':  admin?.email        || '',
+    };
+    return fetch(url, { ...opts, headers });
+  };
+
   // Always start empty — populated exclusively from DB, never from shared localStorage
   const [users, setUsers] = useState([]);
   const [usersLoading, setUsersLoading] = useState(true);
@@ -622,7 +648,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     let attempts = 0;
 
     function attempt() {
-      fetch(`/auth/users?admin=${encodeURIComponent(scope)}`)
+      apiFetch(`/auth/users?admin=${encodeURIComponent(scope)}`)
         .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
         .then(dbUsers => {
           if (!Array.isArray(dbUsers)) throw new Error('unexpected response');
@@ -656,6 +682,58 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     return () => { if (fetchUsersRef.current) clearTimeout(fetchUsersRef.current); };
   }, [orgScope]); // eslint-disable-line
 
+  // ── Cloud accounts ────────────────────────────────────────────────────────
+  const [cloudAccounts, setCloudAccounts]               = useState([]);
+  const [cloudAccountsLoading, setCloudAccountsLoading] = useState(false);
+  const [orgUserCloudAccess, setOrgUserCloudAccess]     = useState({}); // email → [{id, provider, label}]
+  const [cloudAccountModal, setCloudAccountModal]       = useState(null); // {userEmail, provider, accounts}
+  const [addCloudAccountModal, setAddCloudAccountModal] = useState(false);
+  const [assignCloudAccountModal, setAssignCloudAccountModal] = useState(null); // account object
+  const [cloudAccountForm, setCloudAccountForm] = useState({ provider: 'aws', label: '', creds: {} });
+  const [cloudAccountSaving, setCloudAccountSaving] = useState(false);
+  const [cloudAccountErr, setCloudAccountErr]       = useState('');
+  const [assignSelection, setAssignSelection]       = useState({}); // email → bool
+  const [assignSaving, setAssignSaving]             = useState(false);
+  const [credViewModal, setCredViewModal]           = useState(null); // {id, label, provider}
+  const [credViewData, setCredViewData]             = useState(null); // {credentials, provider, label}
+  const [credViewLoading, setCredViewLoading]       = useState(false);
+  const [credShowFields, setCredShowFields]         = useState({});
+
+  function loadCloudAccounts(scope) {
+    if (!scope) return;
+    setCloudAccountsLoading(true);
+    apiFetch(`/api/admin/cloud-accounts?uid=${encodeURIComponent(scope)}`)
+      .then(r => r.json())
+      .then(d => { setCloudAccounts(Array.isArray(d.accounts) ? d.accounts : []); setCloudAccountsLoading(false); })
+      .catch(() => setCloudAccountsLoading(false));
+  }
+
+  function loadOrgUserCloudAccess(scope) {
+    if (!scope) return;
+    apiFetch(`/api/admin/users/account-access?uid=${encodeURIComponent(scope)}`)
+      .then(r => r.json())
+      .then(d => { setOrgUserCloudAccess(d.access || {}); })
+      .catch(() => {});
+  }
+
+  async function openCredViewFromUserModal(account) {
+    setCredViewModal(account);
+    setCredViewData(null);
+    setCredViewLoading(true);
+    setCredShowFields({});
+    try {
+      const r = await apiFetch(`/api/admin/cloud-accounts/${account.id}/credentials?uid=${encodeURIComponent(orgScope)}`);
+      const d = await r.json();
+      setCredViewData(d);
+    } catch { setCredViewData({ error: 'Failed to load credentials.' }); }
+    setCredViewLoading(false);
+  }
+
+  useEffect(() => {
+    if (section === 'cloud-accounts') loadCloudAccounts(orgScope);
+    if (section === 'cloud-accounts' || section === 'users') loadOrgUserCloudAccess(orgScope);
+  }, [section, orgScope]); // eslint-disable-line
+
   // ── Deleted users (soft-delete restore window) ────────────────────────────
   const [deletedUsers, setDeletedUsers]   = useState([]);
   const [deletedLoading, setDeletedLoading] = useState(false);
@@ -663,7 +741,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   function loadDeletedUsers(scope) {
     if (!scope) return;
     setDeletedLoading(true);
-    fetch(`/auth/deleted-users?admin=${encodeURIComponent(scope)}`)
+    apiFetch(`/auth/deleted-users?admin=${encodeURIComponent(scope)}`)
       .then(r => r.json())
       .then(list => { setDeletedUsers(Array.isArray(list) ? list : []); setDeletedLoading(false); })
       .catch(() => setDeletedLoading(false));
@@ -673,7 +751,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
 
   function handleRestoreUser(u) {
     if (!window.confirm(`Restore ${u.name || u.email}? They will be able to log in again.`)) return;
-    fetch('/auth/restore-user', {
+    apiFetch('/auth/restore-user', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: u.email, adminEmail: orgScope }),
@@ -697,7 +775,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   function syncAdminDataFromDB() {
     if (!orgScope) return;
     const isCoAdmin = !!admin?.orgAdmin;
-    fetch(`/auth/admin-data/${encodeURIComponent(orgScope)}`)
+    apiFetch(`/auth/admin-data/${encodeURIComponent(orgScope)}`)
       .then(r => r.json())
       .then(data => {
         if (!data || data.error) return;
@@ -746,7 +824,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
           // Push purchasedAt to DB if DB is missing it but localStorage has it
           const localPurchasedAt = patch.planPurchasedAt || s.planPurchasedAt;
           if (!data.planPurchasedAt && localPurchasedAt && orgScope) {
-            fetch('/auth/plan', {
+            apiFetch('/auth/plan', {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ email: orgScope, plan: data.plan, purchasedAt: localPurchasedAt }),
@@ -805,7 +883,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     }
     setEditMode(false);
     if (admin?.email) {
-      fetch('/auth/photo', {
+      apiFetch('/auth/photo', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: admin.email, photo: editPhoto }),
@@ -1281,7 +1359,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
               setSettings(prev => ({ ...prev, currentPlan: planLabel, planPaymentId: response.razorpay_payment_id, planPurchasedAt: purchasedAt }));
               // Persist plan to DB under the org primary admin's email
               if (orgScope) {
-                fetch('/auth/plan', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: orgScope, plan: planLabel, purchasedAt }) }).catch(() => {});
+                apiFetch('/auth/plan', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: orgScope, plan: planLabel, purchasedAt }) }).catch(() => {});
               }
               // Auto-strip tools no longer included in the new plan and persist to DB
               const newAllowed = (PLAN_RESTRICTIONS[planLabel] || { allowedTools: ["monitoring","billing"] }).allowedTools;
@@ -1290,7 +1368,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                 users.forEach(u => {
                   const strippedTools = (u.tools || []).filter(t => newAllowed.includes(t));
                   if (strippedTools.length < (u.tools || []).length) {
-                    fetch(`/auth/users/${encodeURIComponent(u.email)}/tools`, {
+                    apiFetch(`/auth/users/${encodeURIComponent(u.email)}/tools`, {
                       method: 'PUT',
                       headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify({ tools: strippedTools, admin: orgScope }),
@@ -1358,7 +1436,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     if (orgScope) {
       users.forEach(u => {
         if (!(u.tools || []).includes("monitoring") || !(u.tools || []).includes("billing")) {
-          fetch(`/auth/users/${encodeURIComponent(u.email)}/tools`, {
+          apiFetch(`/auth/users/${encodeURIComponent(u.email)}/tools`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tools: ["monitoring", "billing"], admin: orgScope }),
@@ -1369,7 +1447,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     setPayState({ loading: false, planName: "", error: "", success: "" });
     // Persist cancellation to DB so plan is not restored on page refresh
     if (orgScope) {
-      fetch('/auth/plan', {
+      apiFetch('/auth/plan', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: orgScope, plan: null, purchasedAt: null }),
@@ -1461,7 +1539,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
         const removed = sorted.slice(maxUsers);
         removed.forEach(u => {
           const adminParam = encodeURIComponent(orgScope || '');
-          fetch(`/auth/users/${encodeURIComponent(u.email)}?admin=${adminParam}&deletedBy=${adminParam}`, { method: 'DELETE' })
+          apiFetch(`/auth/users/${encodeURIComponent(u.email)}?admin=${adminParam}&deletedBy=${adminParam}`, { method: 'DELETE' })
             .then(() => loadDeletedUsers(orgScope))
             .catch(() => {});
           try {
@@ -1524,7 +1602,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     } catch {}
 
     // Register in backend DB under this admin's org
-    fetch('/auth/register-org-user', {
+    apiFetch('/auth/register-org-user', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: form.name.trim(), email: form.email.trim(), password: pwd, orgAdmin: orgScope, tools: planRestrictions.allowedTools }),
@@ -1560,7 +1638,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     if (window.confirm(`Delete ${target.name}? They will be blocked from logging in. You can restore them within 7 days from the Restore Users section.`)) {
       const adminParam   = encodeURIComponent(orgScope || '');
       const deletedByParam = encodeURIComponent(orgScope || '');
-      fetch(`/auth/users/${encodeURIComponent(target.email)}?admin=${adminParam}&deletedBy=${deletedByParam}`, { method: 'DELETE' })
+      apiFetch(`/auth/users/${encodeURIComponent(target.email)}?admin=${adminParam}&deletedBy=${deletedByParam}`, { method: 'DELETE' })
         .then(() => loadDeletedUsers(orgScope))
         .catch(() => {});
       fetch('/api/revoke-session', {
@@ -1583,7 +1661,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   async function handlePromote(user) {
     setPromoting(user.id); setPromoteErr('');
     try {
-      const r = await fetch('/auth/promote-user', {
+      const r = await apiFetch('/auth/promote-user', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: user.email, orgAdmin: orgScope, maxSubAdmins }),
@@ -1594,7 +1672,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
       } else {
         // Optimistic update immediately, then re-sync from DB to confirm it persisted
         setUsers(prev => prev.map(u => u.id === user.id ? { ...u, role: 'admin' } : u));
-        fetch(`/auth/users?admin=${encodeURIComponent(orgScope)}`)
+        apiFetch(`/auth/users?admin=${encodeURIComponent(orgScope)}`)
           .then(res => res.json())
           .then(dbUsers => {
             if (Array.isArray(dbUsers)) {
@@ -1613,7 +1691,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   async function handleDemote(user) {
     setPromoting(user.id); setPromoteErr('');
     try {
-      const r = await fetch('/auth/demote-user', {
+      const r = await apiFetch('/auth/demote-user', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: user.email, orgAdmin: orgScope }),
@@ -1624,7 +1702,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
       } else {
         // Optimistic update immediately, then re-sync from DB to confirm it persisted
         setUsers(prev => prev.map(u => u.id === user.id ? { ...u, role: 'user' } : u));
-        fetch(`/auth/users?admin=${encodeURIComponent(orgScope)}`)
+        apiFetch(`/auth/users?admin=${encodeURIComponent(orgScope)}`)
           .then(res => res.json())
           .then(dbUsers => {
             if (Array.isArray(dbUsers)) {
@@ -1657,7 +1735,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     updateUsers(newUsers);
     const updated = newUsers.find(u => u.id === userId);
     if (updated && orgScope) {
-      fetch(`/auth/users/${encodeURIComponent(updated.email)}/tools`, {
+      apiFetch(`/auth/users/${encodeURIComponent(updated.email)}/tools`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tools: updated.tools, admin: orgScope }),
@@ -1667,23 +1745,25 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
 
   /* ── Nav items ── */
   const navItems = [
-    { id: "users",    label: "Users",         Icon: UsersIcon },
-    { id: "restore",  label: "Restore Users", Icon: RestoreIcon, badge: deletedUsers.length || null },
-    { id: "access",   label: "Manage Access", Icon: AccessIcon },
-    { id: "plan",     label: "Manage Plan",   Icon: PlanIcon },
-    { id: "account",  label: "Account",       Icon: AccountIcon },
-    { id: "settings", label: "Settings",      Icon: SettingsIcon },
+    { id: "users",          label: "Users",          Icon: UsersIcon },
+    { id: "restore",        label: "Restore Users",  Icon: RestoreIcon, badge: deletedUsers.length || null },
+    { id: "access",         label: "Manage Access",  Icon: AccessIcon },
+    { id: "cloud-accounts", label: "Account Access", Icon: CloudAccountNavIcon },
+    { id: "plan",           label: "Manage Plan",    Icon: PlanIcon },
+    { id: "account",        label: "Account",        Icon: AccountIcon },
+    { id: "settings",       label: "Settings",       Icon: SettingsIcon },
   ];
 
   const sectionTitles = {
     "tool-monitoring": "Monitoring",
     "tool-billing":    "Billing",
-    users:    "Users",
-    restore:  "Restore Users",
-    access:   "Manage Access",
-    plan:     "Manage Plan",
-    account:  "Account",
-    settings: "Settings",
+    users:              "Users",
+    restore:            "Restore Users",
+    access:             "Manage Access",
+    "cloud-accounts":   "Account Access",
+    plan:               "Manage Plan",
+    account:            "Account",
+    settings:           "Settings",
   };
 
   /* ── Section renderers ── */
@@ -1873,6 +1953,26 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                           {u.tools.includes("monitoring") && <span className="ap-tool-badge monitoring">Monitoring</span>}
                           {u.tools.includes("billing")    && <span className="ap-tool-badge billing">Billing</span>}
                           {u.tools.length === 0 && u.role !== 'admin' && <span style={{fontSize:12,color:"#94a3b8"}}>No access</span>}
+                          {/* Cloud account provider badges */}
+                          {(() => {
+                            const userAccounts = orgUserCloudAccess[(u.email || '').toLowerCase()] || [];
+                            const providers = [...new Set(userAccounts.map(a => a.provider))];
+                            return providers.map(p => (
+                              <button
+                                key={p}
+                                title={`View ${p.toUpperCase()} accounts for ${u.name}`}
+                                onClick={() => setCloudAccountModal({
+                                  userEmail: u.email,
+                                  userName: u.name,
+                                  provider: p,
+                                  accounts: userAccounts.filter(a => a.provider === p),
+                                })}
+                                style={{background:"none",border:"1px solid #e2e8f0",borderRadius:6,padding:"2px 5px",cursor:"pointer",display:"inline-flex",alignItems:"center",gap:3,fontSize:11,color:"#475569"}}
+                              >
+                                <ProviderLogo provider={p} size={14} />
+                              </button>
+                            ));
+                          })()}
                         </div>
                       </td>
 
@@ -1983,6 +2083,328 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
             </table>
           )}
         </div>
+      </>
+    );
+  }
+
+  function renderCloudAccounts() {
+    const PROVIDER_FIELDS = {
+      aws:   [
+        { key: 'accessKeyId',     label: 'Access Key ID',     type: 'text',     required: true },
+        { key: 'secretAccessKey', label: 'Secret Access Key', type: 'password', required: true },
+        { key: 'region',          label: 'Default Region',    type: 'text',     placeholder: 'us-east-1' },
+      ],
+      gcp:   [
+        { key: 'projectId',         label: 'Project ID',           type: 'text',     required: true },
+        { key: 'serviceAccountJson',label: 'Service Account JSON',  type: 'textarea', required: true, placeholder: '{"type":"service_account",...}' },
+      ],
+      azure: [
+        { key: 'subscriptionId', label: 'Subscription ID', type: 'text',     required: true },
+        { key: 'tenantId',       label: 'Tenant ID',       type: 'text',     required: true },
+        { key: 'clientId',       label: 'Client ID',       type: 'text',     required: true },
+        { key: 'clientSecret',   label: 'Client Secret',   type: 'password', required: true },
+      ],
+    };
+
+    function maskIdentity(account) {
+      const m = account.accountMeta || {};
+      if (account.provider === 'aws'   && m.awsAccountId)   return `ID: ${m.awsAccountId}`;
+      if (account.provider === 'gcp'   && m.projectId)      return `Project: ${m.projectId}`;
+      if (account.provider === 'azure' && m.subscriptionId) return `Sub: ${m.subscriptionId.toString().slice(0, 8)}…`;
+      return '—';
+    }
+
+    async function handleAddAccount(e) {
+      e.preventDefault();
+      setCloudAccountErr('');
+      setCloudAccountSaving(true);
+      const { provider, label, creds } = cloudAccountForm;
+      let credentials = { ...creds };
+      if (provider === 'gcp' && typeof credentials.serviceAccountJson === 'string') {
+        try { credentials = { ...JSON.parse(credentials.serviceAccountJson), projectId: credentials.projectId }; }
+        catch { setCloudAccountErr('Service account JSON is not valid JSON'); setCloudAccountSaving(false); return; }
+      }
+      try {
+        const r = await apiFetch('/api/admin/cloud-accounts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uid: orgScope, provider, label, credentials }),
+        });
+        const d = await r.json();
+        if (!r.ok || !d.success) { setCloudAccountErr(d.error || d.message || 'Failed — check credentials'); setCloudAccountSaving(false); return; }
+        setAddCloudAccountModal(false);
+        setCloudAccountForm({ provider: 'aws', label: '', creds: {} });
+        loadCloudAccounts(orgScope);
+        loadOrgUserCloudAccess(orgScope);
+      } catch { setCloudAccountErr('Network error'); }
+      setCloudAccountSaving(false);
+    }
+
+    async function handleDeleteAccount(accountId) {
+      if (!window.confirm('Delete this cloud account and all its user assignments?')) return;
+      await apiFetch(`/api/admin/cloud-accounts/${accountId}?uid=${encodeURIComponent(orgScope)}`, { method: 'DELETE' }).catch(() => {});
+      loadCloudAccounts(orgScope);
+      loadOrgUserCloudAccess(orgScope);
+    }
+
+    function openAssignModal(account) {
+      const assigned = new Set((account.assignedUsers || []).map(a => (a.email || '').toLowerCase()));
+      const sel = {};
+      users.forEach(u => { sel[u.email] = assigned.has(u.email.toLowerCase()); });
+      setAssignSelection(sel);
+      setAssignCloudAccountModal(account);
+    }
+
+    async function handleSaveAssignments() {
+      if (!assignCloudAccountModal) return;
+      setAssignSaving(true);
+      const account = assignCloudAccountModal;
+      const currentlyAssigned = new Set((account.assignedUsers || []).map(a => (a.email || '').toLowerCase()));
+      const toAssign   = users.filter(u => assignSelection[u.email]  && !currentlyAssigned.has(u.email.toLowerCase()));
+      const toUnassign = users.filter(u => !assignSelection[u.email] &&  currentlyAssigned.has(u.email.toLowerCase()));
+      await Promise.all([
+        ...toAssign.map(u => apiFetch(`/api/admin/cloud-accounts/${account.id}/assign`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uid: orgScope, userEmail: u.email }),
+        })),
+        ...toUnassign.map(u => apiFetch(`/api/admin/cloud-accounts/${account.id}/unassign`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uid: orgScope, userEmail: u.email }),
+        })),
+      ]).catch(() => {});
+      setAssignCloudAccountModal(null);
+      setAssignSaving(false);
+      loadCloudAccounts(orgScope);
+      loadOrgUserCloudAccess(orgScope);
+    }
+
+    async function openCredView(account) {
+      setCredViewModal(account);
+      setCredViewData(null);
+      setCredViewLoading(true);
+      setCredShowFields({});
+      try {
+        const r = await apiFetch(`/api/admin/cloud-accounts/${account.id}/credentials?uid=${encodeURIComponent(orgScope)}`);
+        const d = await r.json();
+        setCredViewData(d);
+      } catch { setCredViewData({ error: 'Failed to load credentials.' }); }
+      setCredViewLoading(false);
+    }
+
+    const fields = PROVIDER_FIELDS[cloudAccountForm.provider] || [];
+
+    return (
+      <>
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 }}>
+          <div style={{ fontSize: 13, color: '#64748b' }}>
+            Centrally manage cloud credentials and assign accounts to users.
+          </div>
+          <button
+            onClick={() => { setCloudAccountForm({ provider: 'aws', label: '', creds: {} }); setCloudAccountErr(''); setAddCloudAccountModal(true); }}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 16px', background: 'linear-gradient(135deg,#2563eb,#1d4ed8)', color: '#fff', border: 'none', borderRadius: 8, fontWeight: 600, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}
+          >
+            <PlusIcon /> Add Cloud Account
+          </button>
+        </div>
+
+        <div className="ap-card">
+          {cloudAccountsLoading ? (
+            <div className="ap-empty">
+              <div style={{ width: 32, height: 32, border: '3px solid #e2e8f0', borderTopColor: '#2563eb', borderRadius: '50%', animation: 'spin 0.75s linear infinite', margin: '0 auto 12px' }} />
+              <div className="ap-empty-text" style={{ color: '#64748b' }}>Loading accounts…</div>
+            </div>
+          ) : cloudAccounts.length === 0 ? (
+            <div className="ap-empty">
+              <div className="ap-empty-icon">☁️</div>
+              <div className="ap-empty-text">No cloud accounts yet. Add one to get started.</div>
+            </div>
+          ) : (
+            <table className="ap-table">
+              <thead><tr>
+                <th>Account</th><th>Identity</th><th>Assigned Users</th><th>Status</th><th>Actions</th>
+              </tr></thead>
+              <tbody>
+                {cloudAccounts.map(account => {
+                  const assigned = account.assignedUsers || [];
+                  return (
+                    <tr
+                      key={account.id}
+                      onClick={() => openCredView(account)}
+                      style={{ cursor: 'pointer' }}
+                      title="Click to view credentials"
+                    >
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                          <ProviderLogo provider={account.provider} size={22} />
+                          <div>
+                            <div style={{ fontWeight: 700, color: '#0f172a', fontSize: 13 }}>{account.label}</div>
+                            <div style={{ fontSize: 11, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.5 }}>{account.provider}</div>
+                          </div>
+                        </div>
+                      </td>
+                      <td><span style={{ fontSize: 12, color: '#64748b', fontFamily: 'monospace' }}>{maskIdentity(account)}</span></td>
+                      <td>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                          {assigned.length === 0
+                            ? <span style={{ fontSize: 12, color: '#94a3b8' }}>None assigned</span>
+                            : assigned.slice(0, 4).map(a => (
+                                <span key={a.email} style={{ fontSize: 11, background: '#eff6ff', color: '#1d4ed8', border: '1px solid #bfdbfe', borderRadius: 5, padding: '2px 7px', fontWeight: 600 }}>
+                                  {a.name || a.email}
+                                </span>
+                              ))
+                          }
+                          {assigned.length > 4 && <span style={{ fontSize: 11, color: '#94a3b8' }}>+{assigned.length - 4} more</span>}
+                        </div>
+                      </td>
+                      <td>
+                        <span style={{ fontSize: 11, fontWeight: 600, padding: '3px 8px', borderRadius: 5, background: account.status === 'active' ? '#dcfce7' : '#fee2e2', color: account.status === 'active' ? '#15803d' : '#dc2626' }}>
+                          {account.status}
+                        </span>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', gap: 6 }} onClick={e => e.stopPropagation()}>
+                          <button
+                            onClick={() => openAssignModal(account)}
+                            style={{ fontSize: 11, fontWeight: 600, padding: '4px 10px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit' }}
+                          >
+                            Assign Users
+                          </button>
+                          <button
+                            onClick={() => handleDeleteAccount(account.id)}
+                            className="ap-btn-danger"
+                            title="Delete account"
+                          >
+                            <TrashIcon />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* ── Add Cloud Account Modal ── */}
+        {addCloudAccountModal && (
+          <div className="ap-modal-overlay" onClick={() => setAddCloudAccountModal(false)}>
+            <div className="ap-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+              <div className="ap-modal-header">
+                <span>Add Cloud Account</span>
+                <button className="ap-modal-close" onClick={() => setAddCloudAccountModal(false)}>×</button>
+              </div>
+              <form onSubmit={handleAddAccount}>
+                <div className="ap-modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                  <div>
+                    <label style={{ fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 5 }}>Provider</label>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      {['aws', 'gcp', 'azure'].map(p => (
+                        <button
+                          key={p} type="button"
+                          onClick={() => setCloudAccountForm(f => ({ ...f, provider: p, creds: {} }))}
+                          style={{ flex: 1, padding: '8px 0', border: `2px solid ${cloudAccountForm.provider === p ? '#2563eb' : '#e2e8f0'}`, borderRadius: 8, background: cloudAccountForm.provider === p ? '#eff6ff' : '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontWeight: 600, fontSize: 12, color: cloudAccountForm.provider === p ? '#2563eb' : '#374151' }}
+                        >
+                          <ProviderLogo provider={p} size={16} /> {p.toUpperCase()}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <label style={{ fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 5 }}>Label <span style={{ color: '#dc2626' }}>*</span></label>
+                    <input
+                      value={cloudAccountForm.label}
+                      onChange={e => setCloudAccountForm(f => ({ ...f, label: e.target.value }))}
+                      placeholder={`e.g. ${cloudAccountForm.provider === 'aws' ? 'AWS Production' : cloudAccountForm.provider === 'gcp' ? 'GCP Prod Project' : 'Azure Main Sub'}`}
+                      required
+                      style={{ width: '100%', padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: 7, fontSize: 13, fontFamily: 'inherit', boxSizing: 'border-box' }}
+                    />
+                  </div>
+                  {fields.map(f => (
+                    <div key={f.key}>
+                      <label style={{ fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 5 }}>
+                        {f.label} {f.required && <span style={{ color: '#dc2626' }}>*</span>}
+                      </label>
+                      {f.type === 'textarea' ? (
+                        <textarea
+                          rows={4}
+                          value={cloudAccountForm.creds[f.key] || ''}
+                          onChange={e => setCloudAccountForm(cf => ({ ...cf, creds: { ...cf.creds, [f.key]: e.target.value } }))}
+                          placeholder={f.placeholder || ''}
+                          required={!!f.required}
+                          style={{ width: '100%', padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: 7, fontSize: 12, fontFamily: 'monospace', resize: 'vertical', boxSizing: 'border-box' }}
+                        />
+                      ) : (
+                        <input
+                          type={f.type}
+                          value={cloudAccountForm.creds[f.key] || ''}
+                          onChange={e => setCloudAccountForm(cf => ({ ...cf, creds: { ...cf.creds, [f.key]: e.target.value } }))}
+                          placeholder={f.placeholder || ''}
+                          required={!!f.required}
+                          style={{ width: '100%', padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: 7, fontSize: 13, fontFamily: 'inherit', boxSizing: 'border-box' }}
+                        />
+                      )}
+                    </div>
+                  ))}
+                  {cloudAccountErr && (
+                    <div style={{ fontSize: 12, color: '#dc2626', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, padding: '8px 12px' }}>{cloudAccountErr}</div>
+                  )}
+                </div>
+                <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', padding: '16px 24px', borderTop: '1px solid #f1f5f9' }}>
+                  <button type="button" onClick={() => setAddCloudAccountModal(false)} style={{ padding: '8px 18px', border: '1px solid #e2e8f0', borderRadius: 7, background: '#f8fafc', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>Cancel</button>
+                  <button type="submit" disabled={cloudAccountSaving} style={{ padding: '8px 18px', background: 'linear-gradient(135deg,#2563eb,#1d4ed8)', color: '#fff', border: 'none', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: cloudAccountSaving ? 'not-allowed' : 'pointer', opacity: cloudAccountSaving ? 0.6 : 1, fontFamily: 'inherit' }}>
+                    {cloudAccountSaving ? 'Verifying…' : 'Add Account'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ── Assign Users Modal ── */}
+        {assignCloudAccountModal && (
+          <div className="ap-modal-overlay" onClick={() => setAssignCloudAccountModal(null)}>
+            <div className="ap-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 420 }}>
+              <div className="ap-modal-header">
+                <span>Assign Users — {assignCloudAccountModal.label}</span>
+                <button className="ap-modal-close" onClick={() => setAssignCloudAccountModal(null)}>×</button>
+              </div>
+              <div className="ap-modal-body">
+                <div style={{ fontSize: 12, color: '#64748b', marginBottom: 12 }}>
+                  Select users who should have access to this {assignCloudAccountModal.provider.toUpperCase()} account. Assigned users are auto-connected.
+                </div>
+                {users.length === 0 ? (
+                  <div style={{ fontSize: 13, color: '#94a3b8', padding: '12px 0' }}>No users in your org yet.</div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 300, overflowY: 'auto' }}>
+                    {users.map(u => (
+                      <label key={u.email} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', border: '1px solid #e2e8f0', borderRadius: 8, cursor: 'pointer', background: assignSelection[u.email] ? '#eff6ff' : '#fff', borderColor: assignSelection[u.email] ? '#bfdbfe' : '#e2e8f0' }}>
+                        <input
+                          type="checkbox"
+                          checked={!!assignSelection[u.email]}
+                          onChange={e => setAssignSelection(s => ({ ...s, [u.email]: e.target.checked }))}
+                          style={{ width: 15, height: 15, accentColor: '#2563eb' }}
+                        />
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: '#0f172a' }}>{u.name}</div>
+                          <div style={{ fontSize: 11, color: '#94a3b8' }}>{u.email}</div>
+                        </div>
+                        {assignSelection[u.email] && <CheckIcon />}
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', padding: '14px 24px', borderTop: '1px solid #f1f5f9' }}>
+                <button onClick={() => setAssignCloudAccountModal(null)} style={{ padding: '8px 18px', border: '1px solid #e2e8f0', borderRadius: 7, background: '#f8fafc', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>Cancel</button>
+                <button onClick={handleSaveAssignments} disabled={assignSaving} style={{ padding: '8px 18px', background: 'linear-gradient(135deg,#2563eb,#1d4ed8)', color: '#fff', border: 'none', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: assignSaving ? 'not-allowed' : 'pointer', opacity: assignSaving ? 0.6 : 1, fontFamily: 'inherit' }}>
+                  {assignSaving ? 'Saving…' : 'Save Assignments'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </>
     );
   }
@@ -2603,14 +3025,15 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   }
 
   const sectionMap = {
-    "tool-monitoring": () => renderToolSection("monitoring"),
-    "tool-billing":    () => renderToolSection("billing"),
-    users:    renderUsers,
-    restore:  renderRestoreUsers,
-    access:   renderAccess,
-    plan:     renderPlan,
-    account:  renderAccount,
-    settings: renderSettings,
+    "tool-monitoring":  () => renderToolSection("monitoring"),
+    "tool-billing":     () => renderToolSection("billing"),
+    users:              renderUsers,
+    restore:            renderRestoreUsers,
+    access:             renderAccess,
+    "cloud-accounts":   renderCloudAccounts,
+    plan:               renderPlan,
+    account:            renderAccount,
+    settings:           renderSettings,
   };
 
   return (
@@ -2789,6 +3212,144 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
           </div>
         </div>
 
+        {/* Cloud Account Detail Modal (provider badge click in Users tab) */}
+        {cloudAccountModal && (
+          <div className="ap-modal-overlay" onClick={() => setCloudAccountModal(null)}>
+            <div className="ap-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 440 }}>
+              <div className="ap-modal-header">
+                <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <ProviderLogo provider={cloudAccountModal.provider} size={18} />
+                  {cloudAccountModal.provider.toUpperCase()} Accounts — {cloudAccountModal.userName}
+                </span>
+                <button className="ap-modal-close" onClick={() => setCloudAccountModal(null)}>×</button>
+              </div>
+              <div className="ap-modal-body">
+                {cloudAccountModal.accounts.length === 0 ? (
+                  <div style={{ fontSize: 13, color: '#94a3b8' }}>No accounts assigned.</div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {cloudAccountModal.accounts.map(a => (
+                      <div key={a.id} style={{ padding: '10px 14px', border: '1px solid #e2e8f0', borderRadius: 8, background: '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div>
+                          <div style={{ fontWeight: 700, color: '#0f172a', fontSize: 13 }}>{a.label}</div>
+                          <div style={{ fontSize: 11, color: '#22c55e', fontWeight: 600, marginTop: 3 }}>● Connected</div>
+                        </div>
+                        <button
+                          onClick={() => { setCloudAccountModal(null); openCredViewFromUserModal(a); }}
+                          style={{ fontSize: 11, fontWeight: 600, padding: '4px 10px', background: '#eff6ff', color: '#2563eb', border: '1px solid #bfdbfe', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit' }}
+                        >
+                          View Credentials
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div style={{ padding: '12px 24px', borderTop: '1px solid #f1f5f9', textAlign: 'right' }}>
+                <button onClick={() => setCloudAccountModal(null)} style={{ padding: '7px 18px', border: '1px solid #e2e8f0', borderRadius: 7, background: '#f8fafc', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>Close</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Credential View Modal */}
+        {credViewModal && (
+          <div className="ap-modal-overlay" onClick={() => { setCredViewModal(null); setCredViewData(null); }}>
+            <div className="ap-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+              <div className="ap-modal-header">
+                <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <ProviderLogo provider={credViewModal.provider} size={18} />
+                  {credViewModal.label} — Credentials
+                </span>
+                <button className="ap-modal-close" onClick={() => { setCredViewModal(null); setCredViewData(null); }}>×</button>
+              </div>
+              <div className="ap-modal-body">
+                {credViewLoading ? (
+                  <div style={{ textAlign: 'center', padding: '28px 0', color: '#64748b' }}>
+                    <div style={{ width: 28, height: 28, border: '3px solid #e2e8f0', borderTopColor: '#2563eb', borderRadius: '50%', animation: 'spin 0.75s linear infinite', margin: '0 auto 10px' }} />
+                    Loading credentials…
+                  </div>
+                ) : credViewData?.error ? (
+                  <div style={{ color: '#dc2626', fontSize: 13 }}>{credViewData.error}</div>
+                ) : credViewData ? (() => {
+                  const creds = credViewData.credentials || {};
+                  const provider = credViewModal.provider;
+
+                  const SENSITIVE = new Set(['secretAccessKey', 'sessionToken', 'clientSecret', 'private_key', 'private_key_id']);
+                  const GCP_META = new Set(['type', 'auth_uri', 'token_uri', 'auth_provider_x509_cert_url', 'client_x509_cert_url', 'universe_domain']);
+
+                  const renderField = (key, value) => {
+                    const isSecret = SENSITIVE.has(key);
+                    const show = credShowFields[key];
+                    const displayVal = isSecret && !show ? '••••••••••••••••••••' : (typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? ''));
+                    return (
+                      <div key={key} style={{ marginBottom: 12 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 4, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                          <span>{key.replace(/_/g, ' ')}</span>
+                          {isSecret && (
+                            <button
+                              onClick={() => setCredShowFields(s => ({ ...s, [key]: !s[key] }))}
+                              style={{ fontSize: 10, fontWeight: 600, padding: '1px 7px', background: show ? '#fef3c7' : '#f1f5f9', color: show ? '#92400e' : '#475569', border: `1px solid ${show ? '#fde68a' : '#e2e8f0'}`, borderRadius: 4, cursor: 'pointer', fontFamily: 'inherit' }}
+                            >
+                              {show ? 'Hide' : 'Reveal'}
+                            </button>
+                          )}
+                        </div>
+                        <div
+                          style={{ fontFamily: 'monospace', fontSize: 12, background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 6, padding: '7px 10px', wordBreak: 'break-all', whiteSpace: typeof value === 'object' ? 'pre-wrap' : 'normal', color: '#0f172a', maxHeight: 120, overflowY: 'auto', userSelect: show || !isSecret ? 'text' : 'none' }}
+                        >
+                          {displayVal}
+                        </div>
+                      </div>
+                    );
+                  };
+
+                  if (provider === 'aws') {
+                    return (
+                      <div>
+                        {renderField('accessKeyId', creds.accessKeyId)}
+                        {renderField('secretAccessKey', creds.secretAccessKey)}
+                        {creds.region && renderField('region', creds.region)}
+                        {creds.sessionToken && renderField('sessionToken', creds.sessionToken)}
+                      </div>
+                    );
+                  }
+                  if (provider === 'gcp') {
+                    const projectId = creds.projectId || creds.project_id;
+                    return (
+                      <div>
+                        {projectId && renderField('projectId', projectId)}
+                        {renderField('client_email', creds.client_email)}
+                        {renderField('private_key', creds.private_key)}
+                        {Object.entries(creds).filter(([k]) => !['projectId','project_id','private_key','client_email','auth_type'].includes(k) && !GCP_META.has(k)).map(([k,v]) => renderField(k, v))}
+                      </div>
+                    );
+                  }
+                  if (provider === 'azure') {
+                    return (
+                      <div>
+                        {renderField('subscriptionId', creds.subscriptionId)}
+                        {renderField('tenantId', creds.tenantId)}
+                        {renderField('clientId', creds.clientId)}
+                        {renderField('clientSecret', creds.clientSecret)}
+                      </div>
+                    );
+                  }
+                  return <div>{Object.entries(creds).map(([k, v]) => renderField(k, v))}</div>;
+                })() : null}
+
+                <div style={{ marginTop: 12, padding: '10px 14px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 7, fontSize: 11, color: '#92400e', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                  Credentials are encrypted with AES-256-GCM and only visible to org admins.
+                </div>
+              </div>
+              <div style={{ padding: '12px 24px', borderTop: '1px solid #f1f5f9', textAlign: 'right' }}>
+                <button onClick={() => { setCredViewModal(null); setCredViewData(null); }} style={{ padding: '7px 18px', border: '1px solid #e2e8f0', borderRadius: 7, background: '#f8fafc', cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' }}>Close</button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Export Date Range Modal */}
         {exportModal && (
           <div className="ap-modal-overlay" onClick={e => e.target === e.currentTarget && setExportModal(null)}>
@@ -2889,19 +3450,65 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                     <div className="ap-field">
                       <label>Password</label>
                       <div className="ap-pass-tabs">
-                        <button className={`ap-pass-tab ${form.passType === "auto" ? "active" : ""}`} onClick={() => setForm(p => ({...p, passType:"auto"}))}>Auto Generate</button>
-                        <button className={`ap-pass-tab ${form.passType === "manual" ? "active" : ""}`} onClick={() => setForm(p => ({...p, passType:"manual"}))}>Set Password</button>
+                        <button className={`ap-pass-tab ${form.passType === "auto" ? "active" : ""}`} onClick={() => setForm(p => ({...p, passType:"auto", password:"", showPass:false}))}>Auto Generate</button>
+                        <button className={`ap-pass-tab ${form.passType === "manual" ? "active" : ""}`} onClick={() => setForm(p => ({...p, passType:"manual", password:"", showPass:false}))}>Set Password</button>
                       </div>
                       {form.passType === "auto" ? (
                         <div className="ap-autogen-info">A <strong>strong random password</strong> will be generated and shown <strong>once</strong> after creation. Make sure to copy it immediately.</div>
-                      ) : (
-                        <div className="ap-input-wrap">
-                          <input className="ap-input" type={form.showPass ? "text" : "password"} placeholder="Enter password" value={form.password} onChange={e => setForm(p => ({...p, password: e.target.value}))} />
-                          <button className="ap-input-eye" type="button" onClick={() => setForm(p => ({...p, showPass: !p.showPass}))}>
-                            {form.showPass ? <EyeOffIcon /> : <EyeIcon />}
-                          </button>
-                        </div>
-                      )}
+                      ) : (() => {
+                        const pw = form.password || "";
+                        let s = 0;
+                        if (pw.length >= 8)  s++;
+                        if (pw.length >= 12) s++;
+                        if (/[A-Z]/.test(pw)) s++;
+                        if (/[0-9]/.test(pw)) s++;
+                        if (/[^A-Za-z0-9]/.test(pw)) s++;
+                        const sColor = ["#ef4444","#f97316","#eab308","#22c55e","#16a34a","#15803d"][s];
+                        const sLabel = ["Too short","Weak","Fair","Good","Strong","Very strong"][s];
+                        return (
+                          <>
+                            <div className="ap-input-wrap">
+                              <input
+                                className="ap-input"
+                                type={form.showPass ? "text" : "password"}
+                                placeholder="Enter password"
+                                value={form.password}
+                                autoComplete="new-password"
+                                onChange={e => setForm(p => ({...p, password: e.target.value}))}
+                              />
+                              <button className="ap-input-eye" type="button" onClick={() => setForm(p => ({...p, showPass: !p.showPass}))}>
+                                {form.showPass ? <EyeOffIcon /> : <EyeIcon />}
+                              </button>
+                            </div>
+                            {pw.length > 0 && (
+                              <div style={{marginTop:8}}>
+                                {/* Strength bars */}
+                                <div style={{display:"flex",gap:4,marginBottom:5}}>
+                                  {[0,1,2,3,4].map(i => (
+                                    <div key={i} style={{flex:1,height:4,borderRadius:3,background: i < s ? sColor : "#e2e8f0",transition:"background 0.2s"}}/>
+                                  ))}
+                                </div>
+                                <div style={{fontSize:11,fontWeight:700,color:sColor,marginBottom:8}}>{sLabel}</div>
+                                {/* Criteria checklist */}
+                                <div style={{display:"flex",flexDirection:"column",gap:3}}>
+                                  {[
+                                    [pw.length >= 8,  "At least 8 characters"],
+                                    [pw.length >= 12, "12+ characters (recommended)"],
+                                    [/[A-Z]/.test(pw),"Uppercase letter"],
+                                    [/[0-9]/.test(pw),"Number"],
+                                    [/[^A-Za-z0-9]/.test(pw),"Special character (@#$!…)"],
+                                  ].map(([met, label]) => (
+                                    <div key={label} style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color: met ? "#16a34a" : "#94a3b8"}}>
+                                      <span style={{fontSize:13,lineHeight:1}}>{met ? "✓" : "○"}</span>
+                                      {label}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
                     </div>
                     {/* Plan-based tool assignment info */}
                     <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:9,padding:"10px 14px",marginBottom:14,fontSize:12,color:"#475569"}}>

@@ -51,6 +51,28 @@ def init_db():
           expires_at      TEXT NOT NULL,
           UNIQUE(tool, provider, org_admin)
         );
+        CREATE TABLE IF NOT EXISTS cloud_accounts (
+          id              INTEGER PRIMARY KEY AUTOINCREMENT,
+          org_admin       TEXT    NOT NULL,
+          provider        TEXT    NOT NULL CHECK(provider IN ('aws','gcp','azure')),
+          label           TEXT    NOT NULL,
+          credentials_enc TEXT    NOT NULL,
+          account_meta    TEXT,
+          status          TEXT    NOT NULL DEFAULT 'active',
+          created_at      TEXT    DEFAULT (datetime('now')),
+          created_by      TEXT    NOT NULL,
+          updated_at      TEXT    DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cloud_accounts_org ON cloud_accounts(org_admin);
+        CREATE TABLE IF NOT EXISTS cloud_account_access (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          account_id  INTEGER NOT NULL,
+          user_email  TEXT    NOT NULL,
+          granted_at  TEXT    DEFAULT (datetime('now')),
+          granted_by  TEXT,
+          UNIQUE(account_id, user_email)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cloud_account_access_user ON cloud_account_access(user_email);
         """)
 
 
@@ -169,6 +191,63 @@ def get_org_admin_for_user(email: str) -> str:
             return (row["org_admin"] or email).lower().strip()
     except Exception:
         return email.lower().strip()
+
+
+# ── Cloud Accounts (read-only — Node/monitoring is the sole writer) ───────
+
+def _account_row(r: sqlite3.Row) -> dict:
+    meta = None
+    try:
+        meta = json.loads(r["account_meta"]) if r["account_meta"] else None
+    except Exception:
+        pass
+    return {
+        "id": r["id"], "orgAdmin": r["org_admin"], "provider": r["provider"],
+        "label": r["label"], "accountMeta": meta, "status": r["status"],
+        "createdAt": r["created_at"], "createdBy": r["created_by"], "updatedAt": r["updated_at"],
+    }
+
+
+def get_cloud_account(account_id: int) -> dict | None:
+    with _conn() as db:
+        row = db.execute("SELECT * FROM cloud_accounts WHERE id=?", (account_id,)).fetchone()
+    if row is None:
+        return None
+    account = _account_row(row)
+    account["credentials"] = _safe_decrypt(row["credentials_enc"])
+    return account
+
+
+def list_accounts_for_user(user_email: str) -> list[dict]:
+    email = (user_email or "").lower().strip()
+    with _conn() as db:
+        rows = db.execute("""
+            SELECT ca.* FROM cloud_accounts ca
+            JOIN cloud_account_access a ON a.account_id = ca.id
+            WHERE LOWER(a.user_email)=? AND ca.status='active'
+            ORDER BY ca.created_at ASC
+        """, (email,)).fetchall()
+    return [_account_row(r) for r in rows]
+
+
+def list_accounts_for_org(org_admin: str) -> list[dict]:
+    org = (org_admin or "").lower().strip()
+    with _conn() as db:
+        rows = db.execute(
+            "SELECT * FROM cloud_accounts WHERE org_admin=? AND status='active' ORDER BY created_at ASC",
+            (org,)
+        ).fetchall()
+    return [_account_row(r) for r in rows]
+
+
+def is_user_assigned_to_account(user_email: str, account_id: int) -> bool:
+    email = (user_email or "").lower().strip()
+    with _conn() as db:
+        row = db.execute(
+            "SELECT 1 FROM cloud_account_access WHERE account_id=? AND LOWER(user_email)=?",
+            (account_id, email)
+        ).fetchone()
+    return row is not None
 
 
 # ── Logs ─────────────────────────────────────────────────────────────────

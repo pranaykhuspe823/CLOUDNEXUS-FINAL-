@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import json, io, csv
 import os, sys
@@ -19,7 +19,8 @@ import threading
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..')))
 try:
     from cloudnexus_db import init_db, save_cloud_session, load_cloud_sessions, \
-        load_all_cloud_sessions, delete_cloud_session, add_log, get_org_admin_for_user
+        load_all_cloud_sessions, delete_cloud_session, add_log, get_org_admin_for_user, \
+        get_cloud_account, list_accounts_for_user, list_accounts_for_org, is_user_assigned_to_account
     init_db()
     _db_available = True
 except Exception as _db_err:
@@ -31,6 +32,10 @@ except Exception as _db_err:
     def delete_cloud_session(*a, **kw): pass
     def add_log(*a, **kw): pass
     def get_org_admin_for_user(*a, **kw): return ""
+    def get_cloud_account(*a, **kw): return None
+    def list_accounts_for_user(*a, **kw): return []
+    def list_accounts_for_org(*a, **kw): return []
+    def is_user_assigned_to_account(*a, **kw): return False
 
 try:
     from forecaster import run_forecast
@@ -50,9 +55,7 @@ except ModuleNotFoundError:
 app = FastAPI(title="CloudNexus API v2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Per-org credentials: {orgAdmin: {provider: {auth_type, creds, meta}}}
-_org_credentials: Dict[str, Dict[str, Dict]] = {}
-_real_data_cache: Dict[str, tuple] = {}  # orgAdmin → (data, timestamp)
+_real_data_cache: Dict[str, tuple] = {}  # uid → (data, timestamp)
 _real_data_cache_lock = threading.Lock()
 _REAL_DATA_CACHE_TTL = 120.0
 
@@ -66,51 +69,76 @@ def _resolve_org(uid: str) -> str:
         return uid.lower().strip()
 
 
-# ── Restore sessions from DB on startup (per-org) ─────────────────────────
-def _restore_sessions():
-    for s in load_all_cloud_sessions("billing"):
-        org_admin = (s.get("org_admin") or "").strip()
-        provider  = s["provider"]
-        creds     = s["credentials"]
-        if creds:
-            if org_admin not in _org_credentials:
-                _org_credentials[org_admin] = {}
-            if provider not in _org_credentials[org_admin]:
-                _org_credentials[org_admin][provider] = {
-                    "auth_type": creds.get("auth_type", "iam"), "creds": creds, "meta": {}
-                }
-                print(f"[DB] Restored [{org_admin}] {provider} session (expires {s['expires_at']})")
+def _get_account_creds(account_id: int) -> Optional[Dict]:
+    """Load and decrypt credentials for one cloud account from the shared DB."""
+    if not _db_available:
+        return None
+    try:
+        account = get_cloud_account(account_id)
+        if not account or not account.get("credentials"):
+            return None
+        creds = dict(account["credentials"])
+        auth_type = creds.pop("auth_type", None) or (
+            "service_account" if account["provider"] == "gcp" else "iam"
+        )
+        return {"auth_type": auth_type, "creds": creds, "meta": account.get("accountMeta") or {}}
+    except Exception as e:
+        print(f"[billing] _get_account_creds({account_id}) error: {e}")
+        return None
 
-_restore_sessions()
+
+def _build_org_creds_for_uid(uid: str) -> Dict[str, Dict]:
+    """
+    Build the {provider: {auth_type, creds, meta}} map expected by get_real_data(),
+    using the first active account per provider from this user's accessible accounts.
+    """
+    if not uid or not _db_available:
+        return {}
+    try:
+        org_admin = get_org_admin_for_user(uid.lower().strip())
+        is_admin  = bool(org_admin) and org_admin == uid.lower().strip()
+        accounts  = list_accounts_for_org(org_admin) if is_admin else list_accounts_for_user(uid.lower().strip())
+    except Exception:
+        return {}
+    seen: Dict[str, Dict] = {}
+    for a in accounts:
+        p = a.get("provider")
+        if not p or p in seen:
+            continue
+        cred_info = _get_account_creds(a["id"])
+        if cred_info:
+            seen[p] = cred_info
+    return seen
 
 
-def _invalidate_real_cache(org_admin: str = None) -> None:
-    if org_admin is not None:
-        _real_data_cache.pop(org_admin, None)
+def _invalidate_real_cache(uid: str = None) -> None:
+    if uid is not None:
+        _real_data_cache.pop((uid or "").lower().strip(), None)
     else:
         _real_data_cache.clear()
 
 
-def _get_cached_real_data(org_admin: str = "") -> dict:
-    now    = time()
-    cached = _real_data_cache.get(org_admin)
+def _get_cached_real_data(uid: str = "") -> dict:
+    key = (uid or "").lower().strip()
+    now = time()
+    cached = _real_data_cache.get(key)
     if cached is not None:
         data, ts = cached
         if now - ts < _REAL_DATA_CACHE_TTL:
             return data
     with _real_data_cache_lock:
-        cached = _real_data_cache.get(org_admin)
+        cached = _real_data_cache.get(key)
         if cached is not None:
             data, ts = cached
             if now - ts < _REAL_DATA_CACHE_TTL:
                 return data
-        org_creds = _org_credentials.get(org_admin, {})
+        org_creds = _build_org_creds_for_uid(key)
         try:
             data = get_real_data(org_creds)
         except ModuleNotFoundError:
             from .real_data import get_real_data as gr
             data = gr(org_creds)
-        _real_data_cache[org_admin] = (data, now)
+        _real_data_cache[key] = (data, now)
         return data
 
 
@@ -516,55 +544,63 @@ class CredentialPayload(BaseModel):
     uid:         str = ""
 
 
+def check_account_access_response(uid: str, account_id: Optional[int]):
+    """Returns a JSONResponse with the appropriate error if access is denied, else None."""
+    if not account_id:
+        return JSONResponse(status_code=400, content={"error": "missing_account", "message": "account_id is required."})
+    if not _db_available:
+        return None
+    try:
+        account = get_cloud_account(account_id)
+    except Exception:
+        account = None
+    if account is None:
+        return JSONResponse(status_code=404, content={"error": "not_found", "message": "Cloud account not found."})
+    org_admin = get_org_admin_for_user(uid.lower().strip()) if uid else ""
+    is_admin = bool(org_admin) and org_admin == (uid or "").lower().strip() and account.get("orgAdmin") == org_admin
+    if is_admin:
+        return None
+    try:
+        assigned = is_user_assigned_to_account(uid, account_id)
+    except Exception:
+        assigned = False
+    if not assigned:
+        return JSONResponse(status_code=403, content={"error": "not_assigned", "message": "You do not have access to this cloud account."})
+    return None
+
+
 @app.post("/api/credentials/connect")
 async def credentials_connect(payload: CredentialPayload):
-    org_admin = _resolve_org(payload.uid)
-    provider  = payload.provider.lower()
-    auth_type = payload.auth_type
-    creds     = payload.credentials
-    try:
-        if provider == "aws":
-            result = connect_aws(auth_type, creds)
-        elif provider == "gcp":
-            result = connect_gcp(auth_type, creds)
-        elif provider == "azure":
-            result = connect_azure(auth_type, creds)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
-        if result["success"]:
-            if org_admin not in _org_credentials:
-                _org_credentials[org_admin] = {}
-            _org_credentials[org_admin][provider] = {"auth_type": auth_type, "creds": creds, "meta": result}
-            _invalidate_real_cache(org_admin)
-            save_cloud_session("billing", provider, org_admin, {"auth_type": auth_type, **creds})
-            add_log(payload.uid or None, f"connect_{provider}", "billing", provider, {"auth_type": auth_type})
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    return JSONResponse(status_code=410, content={
+        "success": False, "error": "admin_only",
+        "message": "Credential management has moved to the Admin Portal. Contact your admin to add cloud accounts."
+    })
 
 
 @app.post("/api/credentials/disconnect")
 async def credentials_disconnect(payload: dict):
-    uid      = str(payload.get("uid", "") or "")
-    org_admin = _resolve_org(uid)
-    provider = str(payload.get("provider", "") or "").lower()
-    if org_admin in _org_credentials:
-        _org_credentials[org_admin].pop(provider, None)
-    _invalidate_real_cache(org_admin)
-    delete_cloud_session("billing", provider, org_admin)
-    add_log(uid or None, f"disconnect_{provider}", "billing", provider, None)
-    return {"success": True}
+    return JSONResponse(status_code=410, content={
+        "success": False, "error": "admin_only",
+        "message": "Credential management has moved to the Admin Portal. Contact your admin to remove cloud accounts."
+    })
 
 
 @app.get("/api/credentials/status")
 def credentials_status(uid: str = ""):
-    org_admin = _resolve_org(uid)
-    org_creds = _org_credentials.get(org_admin, {})
-    return {p: {"connected": p in org_creds,
-                "auth_type": org_creds[p].get("auth_type") if p in org_creds else None}
-            for p in ["aws", "gcp", "azure"]}
+    if not _db_available:
+        return {p: {"connected": False, "auth_type": None} for p in ["aws", "gcp", "azure"]}
+    try:
+        org_admin = get_org_admin_for_user(uid.lower().strip()) if uid else ""
+        is_admin  = bool(org_admin) and org_admin == (uid or "").lower().strip()
+        accounts  = list_accounts_for_org(org_admin) if is_admin else list_accounts_for_user((uid or "").lower().strip())
+    except Exception:
+        accounts = []
+    by_provider: Dict[str, Dict] = {}
+    for a in accounts:
+        p = a.get("provider")
+        if p and p not in by_provider:
+            by_provider[p] = {"connected": True, "auth_type": None, "accountId": a["id"], "label": a.get("label")}
+    return {p: by_provider.get(p, {"connected": False, "auth_type": None}) for p in ["aws", "gcp", "azure"]}
 
 
 class ReportSchedulePayload(BaseModel):
@@ -703,8 +739,7 @@ def _get_data(mode: str, uid: str = "") -> dict:
         except ModuleNotFoundError:
             from .mock_data import get_mock_data as gm
             return gm()
-    org_admin = _resolve_org(uid)
-    return _get_cached_real_data(org_admin)
+    return _get_cached_real_data(uid)
 
 
 
@@ -728,9 +763,11 @@ def trend(mode: str = "mock", days: int = 90, uid: str = ""):
 
 
 @app.get("/api/analysis")
-def analysis(mode: str = "real", uid: str = ""):
-    org_admin  = _resolve_org(uid)
-    org_creds  = _org_credentials.get(org_admin, {})
+def analysis(mode: str = "real", uid: str = "", account_id: Optional[int] = None):
+    err = check_account_access_response(uid, account_id)
+    if err is not None:
+        return err
+    org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
     try:
         if mode == "mock":
             payload = analyze_cross_cloud({})
@@ -813,10 +850,15 @@ def export_json(mode: str = "mock", uid: str = ""):
 # ── INVOICES ──────────────────────────────────────────────────────────
 
 @app.get("/api/invoices/{provider}")
-def get_invoices(provider: str, mode: str = "mock", uid: str = ""):
-    from real_data import get_real_invoices
-    org_admin = _resolve_org(uid)
-    org_creds = _org_credentials.get(org_admin, {})
+def get_invoices(provider: str, mode: str = "mock", uid: str = "", account_id: Optional[int] = None):
+    err = check_account_access_response(uid, account_id)
+    if err is not None:
+        return err
+    try:
+        from real_data import get_real_invoices
+    except ModuleNotFoundError:
+        from .real_data import get_real_invoices
+    org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
     provider  = provider.lower()
     if provider not in ["aws", "gcp", "azure"]:
         raise HTTPException(status_code=400, detail="Invalid provider")
@@ -879,9 +921,11 @@ def get_invoices(provider: str, mode: str = "mock", uid: str = ""):
 # ── MONTHLY TREND ──────────────────────────────────────────────────────
 
 @app.get("/api/trend/monthly")
-def monthly_trend(mode: str = "mock", uid: str = ""):
-    org_admin = _resolve_org(uid)
-    org_creds = _org_credentials.get(org_admin, {})
+def monthly_trend(mode: str = "mock", uid: str = "", account_id: Optional[int] = None):
+    err = check_account_access_response(uid, account_id)
+    if err is not None:
+        return err
+    org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
     if mode == "real" and org_creds:
         data = _get_data(mode, uid)
         trend = data.get("trend", [])
@@ -921,20 +965,22 @@ def monthly_trend(mode: str = "mock", uid: str = ""):
 # ── COST COMPARISON (Multi-Cloud FinOps) ──────────────────────────────
 
 @app.get("/api/cost-comparison")
-def cost_comparison(mode: str = "mock", uid: str = ""):
+def cost_comparison(mode: str = "mock", uid: str = "", account_id: Optional[int] = None):
     """
     Multi-cloud cost comparison payload: provider stats, radar, monthly history,
     budget analysis, savings recommendations, and cross-service table.
     Mirrors the Cost Analyst v2 comparison feature.
     """
+    err = check_account_access_response(uid, account_id)
+    if err is not None:
+        return err
     try:
         from cost_comparison import build_comparison_payload
     except ModuleNotFoundError:
         from .cost_comparison import build_comparison_payload
 
-    org_admin  = _resolve_org(uid)
-    org_creds  = _org_credentials.get(org_admin, {})
-    data       = _get_data(mode, uid)
+    org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
+    data      = _get_data(mode, uid)
     providers_raw = data.get("providers", {})
 
     # Normalise provider info for the comparison builder
@@ -950,11 +996,7 @@ def cost_comparison(mode: str = "mock", uid: str = ""):
             "real_data":  (p in org_creds),
         }
 
-    # Pull live budgets from credentials meta if available
     budgets = None
-    for p in ("aws", "gcp", "azure"):
-        if p in org_creds and isinstance(org_creds[p].get("meta"), dict):
-            pass
 
     # Compute monthly rollup from actual trend data (real when providers are connected)
     real_monthly = None
@@ -980,16 +1022,18 @@ def cost_comparison(mode: str = "mock", uid: str = ""):
 # ── ALL RESOURCES — full inventory from every connected provider ────────
 
 @app.get("/api/all-resources")
-def all_resources_endpoint(mode: str = "mock", uid: str = ""):
+def all_resources_endpoint(mode: str = "mock", uid: str = "", account_id: Optional[int] = None):
     """
     Returns every provisioned resource (EC2, RDS, S3, Lambda, EKS, ECS,
     Azure VMs, Storage Accounts, GCP Compute) with type, state, region.
     Real mode uses live cloud APIs; mock mode derives from billing services.
     """
-    org_admin = _resolve_org(uid)
-    org_creds = _org_credentials.get(org_admin, {})
+    err = check_account_access_response(uid, account_id)
+    if err is not None:
+        return err
+    org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
     if mode == "real" and org_creds:
-        data = _get_cached_real_data(org_admin)
+        data = _get_cached_real_data(uid)
         merged = []
         for p in ("aws", "gcp", "azure"):
             pdata = data.get("providers", {}).get(p, {})
@@ -1019,18 +1063,20 @@ def all_resources_endpoint(mode: str = "mock", uid: str = ""):
 # ── NAMED RESOURCES — real user-defined names + specs ─────────────────
 
 @app.get("/api/resources/named")
-def named_resources(mode: str = "real", uid: str = ""):
+def named_resources(mode: str = "real", uid: str = "", account_id: Optional[int] = None):
     """
     Return all resources with user-defined names and full specs
     from every connected cloud provider.
     """
+    err = check_account_access_response(uid, account_id)
+    if err is not None:
+        return err
     try:
         from real_data import get_named_resources
     except ModuleNotFoundError:
         from .real_data import get_named_resources
 
-    org_admin = _resolve_org(uid)
-    org_creds = _org_credentials.get(org_admin, {})
+    org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
     if mode == "real" and org_creds:
         resources = get_named_resources(org_creds)
         if resources:

@@ -1,401 +1,108 @@
-import React, { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
+import React, { useState, useEffect } from 'react';
 import ProviderLogo from './ProviderLogo';
 
-function getApiBase() {
-  if (typeof window !== 'undefined' && window.location.pathname.startsWith('/billing')) {
-    return '/billing/api';
-  }
-  return '/api';
-}
+const PROVIDER_LABELS = { aws: 'Amazon Web Services', gcp: 'Google Cloud', azure: 'Microsoft Azure' };
+const PROVIDER_COLORS = { aws: '#FF9900', gcp: '#4285F4', azure: '#008AD7' };
 
-/* ─── per-provider field schemas ─── */
-const SCHEMAS = {
-  aws: {
-    label: 'AWS', color: '#FF9900', bg: '#FFF4E0',
-    description: 'Connect your Amazon Web Services account to pull live billing, EC2, S3, RDS, and Lambda data.',
-    authTypes: [
-      {
-        id: 'iam',
-        label: 'IAM User',
-        sublabel: 'Recommended — least privilege access',
-        fields: [
-          { id: 'access_key_id',     label: 'Access Key ID',     type: 'text',     placeholder: 'AKIAIOSFODNN7EXAMPLE',  hint: 'Found in IAM → Users → Security credentials' },
-          { id: 'secret_access_key', label: 'Secret Access Key', type: 'password', placeholder: '••••••••••••••••••••••••',hint: 'Shown once at creation time' },
-          { id: 'region',            label: 'Default Region',    type: 'select',   placeholder: 'us-east-1',
-            options: ['us-east-1','us-east-2','us-west-1','us-west-2','eu-west-1','eu-central-1','ap-south-1','ap-southeast-1','ap-northeast-1'] },
-          { id: 'session_token',     label: 'Session Token',     type: 'password', placeholder: 'Optional — for temporary credentials', optional: true },
-        ],
-      },
-      {
-        id: 'root',
-        label: 'Root Account',
-        sublabel: 'Not recommended for production',
-        fields: [
-          { id: 'access_key_id',     label: 'Root Access Key ID',     type: 'text',     placeholder: 'AKIAIOSFODNN7EXAMPLE' },
-          { id: 'secret_access_key', label: 'Root Secret Access Key', type: 'password', placeholder: '••••••••••••••••••••••••' },
-          { id: 'region',            label: 'Default Region',         type: 'select',   placeholder: 'us-east-1',
-            options: ['us-east-1','us-east-2','us-west-1','us-west-2','eu-west-1','eu-central-1','ap-south-1','ap-southeast-1','ap-northeast-1'] },
-        ],
-        warning: 'Root credentials have full account access. Consider using an IAM user with read-only Cost Explorer permissions instead.',
-      },
-    ],
-  },
-  gcp: {
-    label: 'GCP', color: '#4285F4', bg: '#E8F0FE',
-    description: 'Connect your Google Cloud Platform project to pull live Compute Engine, BigQuery, GKE, and billing data.',
-    authTypes: [
-      {
-        id: 'service_account',
-        label: 'Service Account',
-        sublabel: 'Recommended — fine-grained IAM roles',
-        fields: [
-          { id: 'project_id',          label: 'Project ID',                type: 'text',     placeholder: 'my-gcp-project-123456' },
-          { id: 'service_account_json',label: 'Service Account JSON Key',  type: 'textarea', placeholder: '{\n  "type": "service_account",\n  "project_id": "...",\n  ...\n}', hint: 'Paste full JSON from GCP Console → IAM → Service Accounts → Keys' },
-        ],
-      },
-      {
-        id: 'root',
-        label: 'Owner / Root',
-        sublabel: 'User account with Owner role',
-        fields: [
-          { id: 'project_id',          label: 'Project ID',                type: 'text',     placeholder: 'my-gcp-project-123456' },
-          { id: 'service_account_json',label: 'Owner Service Account JSON',type: 'textarea', placeholder: '{\n  "type": "service_account",\n  ...\n}' },
-        ],
-        warning: 'Owner role grants full project access. Use a read-only service account with Billing Viewer and Viewer roles for security.',
-      },
-    ],
-  },
-  azure: {
-    label: 'Azure', color: '#008AD7', bg: '#E0F2FF',
-    description: 'Connect your Microsoft Azure subscription to pull live VM, Blob Storage, AKS, and cost management data.',
-    authTypes: [
-      {
-        id: 'service_principal',
-        label: 'Service Principal',
-        sublabel: 'Recommended — app-based RBAC access',
-        fields: [
-          { id: 'subscription_id', label: 'Subscription ID', type: 'text',     placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx', hint: 'Azure Portal → Subscriptions' },
-          { id: 'tenant_id',       label: 'Tenant ID',       type: 'text',     placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx', hint: 'Azure Portal → Azure Active Directory → Overview' },
-          { id: 'client_id',       label: 'Client ID',       type: 'text',     placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx', hint: 'App Registration → Application (client) ID' },
-          { id: 'client_secret',   label: 'Client Secret',   type: 'password', placeholder: '••••••••••••••••••••••••', hint: 'App Registration → Certificates & secrets' },
-        ],
-      },
-      {
-        id: 'root',
-        label: 'Root / Owner',
-        sublabel: 'Full subscription owner credentials',
-        fields: [
-          { id: 'subscription_id', label: 'Subscription ID', type: 'text',     placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' },
-          { id: 'tenant_id',       label: 'Tenant ID',       type: 'text',     placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' },
-          { id: 'client_id',       label: 'Client ID',       type: 'text',     placeholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' },
-          { id: 'client_secret',   label: 'Client Secret',   type: 'password', placeholder: '••••••••••••••••••••••••' },
-        ],
-        warning: 'Owner role has full subscription access. Consider Billing Reader + Reader roles for a monitoring-only principal.',
-      },
-    ],
-  },
-};
+export default function CloudConnectModal({ open, uid, onClose, initialConnections }) {
+  const [accounts, setAccounts] = useState([]);
+  const [loading, setLoading]   = useState(false);
+  const [error, setError]       = useState('');
 
-/* ─── Step indicator ─── */
-function StepDot({ n, label, state }) {
-  const bg = state === 'done' ? '#22c55e' : state === 'active' ? '#4285F4' : 'rgba(0,0,0,0.12)';
-  const textColor = state === 'active' ? '#fff' : state === 'done' ? '#fff' : 'rgba(0,0,0,0.35)';
-  return (
-    <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-      <div style={{ width:28, height:28, borderRadius:'50%', background:bg, color:textColor, display:'flex', alignItems:'center', justifyContent:'center', fontSize:13, fontWeight:600, transition:'background 0.3s', flexShrink:0 }}>
-        {state === 'done' ? '✓' : n}
-      </div>
-      <span style={{ fontSize:12, color: state === 'active' ? 'var(--text)' : 'var(--text3)', fontWeight: state === 'active' ? 500 : 400, whiteSpace:'nowrap' }}>{label}</span>
-    </div>
-  );
-}
-
-/* ─── Single provider connect card ─── */
-function ProviderConnectCard({ provider, status, onConnect, onDisconnect }) {
-  const schema = SCHEMAS[provider];
-  const [expanded, setExpanded]     = useState(false);
-  const [authType, setAuthType]     = useState(schema.authTypes[0].id);
-  const [fields, setFields]         = useState({});
-  const [connecting, setConnecting] = useState(false);
-  const [error, setError]           = useState('');
-  const [showJson, setShowJson]     = useState(false);
-
-  const authSchema = schema.authTypes.find(a => a.id === authType);
-
-  function setField(id, val) { setFields(f => ({ ...f, [id]: val })); }
-
-  async function handleConnect() {
+  useEffect(() => {
+    if (!open || !uid) return;
+    setLoading(true);
     setError('');
-    // Validate required fields
-    for (const f of authSchema.fields) {
-      if (!f.optional && !fields[f.id]?.trim()) {
-        setError(`${f.label} is required.`);
-        return;
-      }
-    }
-    setConnecting(true);
-    try {
-      const uid = localStorage.getItem('cn_tool_uid') || '';
-      const payload = { provider, auth_type: authType, credentials: fields, uid };
-      const res = await axios.post(`${getApiBase()}/credentials/connect`, payload);
-      if (res.data.success) {
-        let credMeta = { authType };
-        if (provider === 'aws') {
-          credMeta = { authType, region: fields.region, accessKeyId: (fields.access_key_id || '').slice(0,4) + '****' };
-        } else if (provider === 'gcp') {
-          credMeta = { authType, projectId: fields.project_id };
-        } else if (provider === 'azure') {
-          credMeta = { authType, subscriptionId: fields.subscription_id, tenantId: fields.tenant_id, clientId: fields.client_id };
-        }
-        onConnect(provider, res.data, credMeta);
-        setExpanded(false);
-      } else {
-        setError(res.data.error || 'Connection failed. Check your credentials and try again.');
-      }
-    } catch (e) {
-      setError(e.response?.data?.detail || 'Could not reach backend. Is the server running?');
-    } finally {
-      setConnecting(false);
-    }
-  }
-
-  const isConnected = status?.connected;
-
-  return (
-    <div className="connect-card" style={{ borderColor: isConnected ? schema.color : undefined }}>
-      {/* Header */}
-      <div className="connect-card-header" onClick={() => !isConnected && setExpanded(v => !v)}>
-        <div style={{ display:'flex', alignItems:'center', gap:12 }}>
-          <div className="connect-provider-icon" style={{ background: schema.bg }}>
-            <ProviderLogo provider={provider} size={22} />
-          </div>
-          <div>
-            <div className="connect-provider-name">{schema.label}</div>
-            <div className="connect-provider-desc">{isConnected ? `Connected · ${status.account_id || status.project || status.subscription || ''}` : schema.description.split('.')[0]}</div>
-          </div>
-        </div>
-        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-          {isConnected
-            ? <div className="conn-status-badge connected">✓ Connected</div>
-            : <div className="conn-status-badge">{expanded ? 'Cancel ↑' : 'Connect +'}</div>
-          }
-          {isConnected && (
-            <button className="disconnect-btn" onClick={e => { e.stopPropagation(); onDisconnect(provider); }}>
-              Disconnect
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Expanded form */}
-      {expanded && !isConnected && (
-        <div className="connect-form">
-          {/* Auth type selector */}
-          <div className="auth-type-row">
-            {schema.authTypes.map(at => (
-              <button
-                key={at.id}
-                className={`auth-type-btn ${authType === at.id ? 'active' : ''}`}
-                style={{ '--accent': schema.color }}
-                onClick={() => { setAuthType(at.id); setFields({}); setError(''); }}
-              >
-                <div>
-                  <div className="auth-type-label">{at.label}</div>
-                  <div className="auth-type-sub">{at.sublabel}</div>
-                </div>
-              </button>
-            ))}
-          </div>
-
-          {/* Warning for root */}
-          {authSchema.warning && (
-            <div className="cred-warning">{authSchema.warning}</div>
-          )}
-
-          {/* Fields */}
-          <div className="cred-fields">
-            {authSchema.fields.map(f => (
-              <div key={f.id} className="cred-field">
-                <label className="cred-label">
-                  {f.label}
-                  {f.optional && <span className="optional-tag">optional</span>}
-                </label>
-                {f.type === 'select' ? (
-                  <select
-                    className="cred-input"
-                    value={fields[f.id] || ''}
-                    onChange={e => setField(f.id, e.target.value)}
-                  >
-                    <option value="">Select region…</option>
-                    {f.options.map(o => <option key={o} value={o}>{o}</option>)}
-                  </select>
-                ) : f.type === 'textarea' ? (
-                  <div style={{ position:'relative' }}>
-                    <textarea
-                      className="cred-input cred-textarea"
-                      placeholder={f.placeholder}
-                      value={fields[f.id] || ''}
-                      onChange={e => setField(f.id, e.target.value)}
-                      spellCheck={false}
-                    />
-                    <button
-                      className="paste-btn"
-                      onClick={async () => {
-                        try { const t = await navigator.clipboard.readText(); setField(f.id, t); } catch {}
-                      }}
-                    >Paste</button>
-                  </div>
-                ) : (
-                  <input
-                    className="cred-input"
-                    type={f.type === 'password' && showJson ? 'text' : f.type}
-                    placeholder={f.placeholder}
-                    value={fields[f.id] || ''}
-                    onChange={e => setField(f.id, e.target.value)}
-                    autoComplete="off"
-                  />
-                )}
-                {f.hint && <div className="cred-hint">{f.hint}</div>}
-              </div>
-            ))}
-          </div>
-
-          {error && <div className="cred-error">{error}</div>}
-
-          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginTop:16 }}>
-            <label className="show-toggle">
-              <input type="checkbox" checked={showJson} onChange={e => setShowJson(e.target.checked)} />
-              <span>Show values</span>
-            </label>
-            <div style={{ display:'flex', gap:8 }}>
-              <button className="cred-cancel-btn" onClick={() => { setExpanded(false); setError(''); }}>Cancel</button>
-              <button
-                className="cred-connect-btn"
-                style={{ background: schema.color }}
-                onClick={handleConnect}
-                disabled={connecting}
-              >
-                {connecting ? <><span className="btn-spinner" /> Connecting…</> : `Connect ${schema.label}`}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Connected info */}
-      {isConnected && status.services_count && (
-        <div className="connected-info">
-          <span style={{ display:'inline-flex', alignItems:'center', gap:5 }}>
-            <span style={{ width:8, height:8, borderRadius:'50%', background:'#22c55e', display:'inline-block', flexShrink:0 }} />
-            {status.services_count} services detected
-          </span>
-          <span>·</span>
-          <span>Region: {status.region || status.location || 'global'}</span>
-          <span>·</span>
-          <span>Auth: {status.auth_type}</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ─── Main modal ─── */
-export default function CloudConnectModal({ open, onClose, onAllConnected, initialConnections }) {
-  const [connections, setConnections] = useState(initialConnections || {});
-  const overlayRef = useRef();
-
-  useEffect(() => { setConnections(initialConnections || {}); }, [initialConnections]);
+    fetch(`/api/accounts/mine?uid=${encodeURIComponent(uid)}`)
+      .then(r => r.json())
+      .then(d => { setAccounts(Array.isArray(d.accounts) ? d.accounts : []); setLoading(false); })
+      .catch(() => { setError('Could not load account assignments.'); setLoading(false); });
+  }, [open, uid]);
 
   if (!open) return null;
 
-  const providers = ['aws', 'gcp', 'azure'];
-  const connectedCount = providers.filter(p => connections[p]?.connected).length;
-  const allConnected = connectedCount === 3;
-
-  function handleConnect(provider, data, credMeta) {
-    setConnections(prev => ({ ...prev, [provider]: { connected: true, ...data, credMeta: credMeta || {} } }));
-  }
-  async function handleDisconnect(provider) {
-    const uid = localStorage.getItem('cn_tool_uid') || '';
-    try { await axios.post(`${getApiBase()}/credentials/disconnect`, { provider, uid }); } catch {}
-    setConnections(prev => ({ ...prev, [provider]: { connected: false } }));
-  }
-  function handleProceed() {
-    onAllConnected(connections);
-    onClose();
-  }
-
-  const steps = [
-    { label: 'Switch to Real mode', state: 'done' },
-    { label: 'Connect cloud accounts', state: connectedCount > 0 ? (allConnected ? 'done' : 'active') : 'active' },
-    { label: 'Live data streams in', state: allConnected ? 'active' : 'pending' },
-  ];
+  const byProvider = { aws: [], gcp: [], azure: [] };
+  accounts.forEach(a => { if (byProvider[a.provider]) byProvider[a.provider].push(a); });
 
   return (
-    <div className="modal-overlay" ref={overlayRef} onClick={e => e.target === overlayRef.current && onClose()}>
-      <div className="modal-box">
-        {/* Modal header */}
-        <div className="modal-header">
+    <div
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}
+      onClick={e => e.target === e.currentTarget && onClose()}
+    >
+      <div style={{ background: 'var(--card)', borderRadius: 14, width: '100%', maxWidth: 500, maxHeight: '85vh', overflowY: 'auto', boxShadow: '0 24px 60px rgba(0,0,0,0.4)', border: '1px solid var(--border)' }}>
+        {/* Header */}
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', padding: '20px 24px 0', marginBottom: 18 }}>
           <div>
-            <div className="modal-title">Connect Cloud Accounts</div>
-            <div className="modal-subtitle">Link your AWS, GCP, and Azure accounts to stream live billing and usage data.</div>
+            <div style={{ fontWeight: 700, fontSize: 16, color: 'var(--text1)' }}>☁️ Connected Cloud Accounts</div>
+            <div style={{ fontSize: 13, color: 'var(--text3)', marginTop: 4 }}>Accounts are managed by your admin. Assigned accounts connect automatically.</div>
           </div>
-          <button className="modal-close" onClick={onClose}>✕</button>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', fontSize: 20, color: 'var(--text3)', padding: '0 0 0 12px', lineHeight: 1 }}>✕</button>
         </div>
 
-        {/* Step progress */}
-        <div className="modal-steps">
-          {steps.map((s, i) => (
-            <React.Fragment key={i}>
-              <StepDot n={i+1} label={s.label} state={s.state} />
-              {i < steps.length - 1 && <div className="step-line" style={{ background: s.state === 'done' ? '#22c55e' : 'rgba(0,0,0,0.1)' }} />}
-            </React.Fragment>
-          ))}
-        </div>
+        <div style={{ padding: '0 24px 24px' }}>
+          {loading ? (
+            <div style={{ textAlign: 'center', padding: '32px 0', color: 'var(--text3)' }}>
+              <div style={{ width: 32, height: 32, border: '3px solid var(--border)', borderTopColor: '#2563eb', borderRadius: '50%', animation: 'spin 0.75s linear infinite', margin: '0 auto 12px' }} />
+              Loading your accounts…
+            </div>
+          ) : error ? (
+            <div style={{ padding: '12px 16px', background: 'rgba(239,68,68,0.08)', borderRadius: 8, color: '#ef4444', fontSize: 13 }}>{error}</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {['aws', 'gcp', 'azure'].map(p => {
+                const provAccounts = byProvider[p];
+                const isConnected  = initialConnections?.[p]?.connected || provAccounts.length > 0;
+                const color        = PROVIDER_COLORS[p];
 
-        {/* Connection counter */}
-        <div className="modal-counter">
-          <div className="counter-dots">
-            {providers.map(p => (
-              <div key={p} className="counter-dot" style={{ background: connections[p]?.connected ? SCHEMAS[p].color : 'rgba(0,0,0,0.12)' }}>
-                {connections[p]?.connected && '✓'}
-              </div>
-            ))}
-          </div>
-          <span className="counter-text">{connectedCount}/3 accounts connected</span>
-        </div>
+                return (
+                  <div key={p} style={{ border: `1px solid ${isConnected ? color + '44' : 'var(--border)'}`, borderRadius: 10, overflow: 'hidden' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', background: isConnected ? color + '0d' : 'var(--bg2)' }}>
+                      <ProviderLogo provider={p} size={18} />
+                      <span style={{ fontWeight: 700, fontSize: 13, color: 'var(--text1)' }}>{PROVIDER_LABELS[p]}</span>
+                      {isConnected && (
+                        <span style={{ marginLeft: 'auto', fontSize: 11, fontWeight: 700, color: '#16a34a', background: 'rgba(34,197,94,0.12)', padding: '2px 8px', borderRadius: 10 }}>
+                          ● Connected
+                        </span>
+                      )}
+                    </div>
 
-        {/* Provider cards */}
-        <div className="modal-providers">
-          {providers.map(p => (
-            <ProviderConnectCard
-              key={p}
-              provider={p}
-              status={connections[p]}
-              onConnect={handleConnect}
-              onDisconnect={handleDisconnect}
-            />
-          ))}
-        </div>
+                    <div style={{ padding: '12px 16px', background: 'var(--card)' }}>
+                      {provAccounts.length === 0 ? (
+                        <div style={{ fontSize: 12, color: 'var(--text3)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <span style={{ fontSize: 15 }}>🔒</span>
+                          No {p.toUpperCase()} account assigned yet — contact your admin.
+                        </div>
+                      ) : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                          {provAccounts.map(a => {
+                            const m = a.accountMeta || {};
+                            const identity = p === 'aws' && m.awsAccountId ? `Account ID: ${m.awsAccountId}`
+                              : p === 'gcp' && m.projectId ? `Project: ${m.projectId}`
+                              : p === 'azure' && m.subscriptionId ? `Subscription: ${String(m.subscriptionId).slice(0, 8)}…` : '';
+                            return (
+                              <div key={a.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 12px', background: 'var(--bg2)', borderRadius: 8, border: '0.5px solid var(--border)' }}>
+                                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', flexShrink: 0 }} />
+                                <div>
+                                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text1)' }}>{a.label}</div>
+                                  {identity && <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'monospace' }}>{identity}</div>}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
-        {/* Footer */}
-        <div className="modal-footer">
-          <div className="security-note">
-            Credentials are sent only to your local backend server and never stored in the browser.
-          </div>
-          <div style={{ display:'flex', gap:10 }}>
-            <button className="modal-cancel-btn" onClick={onClose}>
-              {connectedCount > 0 ? 'Use connected accounts' : 'Cancel'}
-            </button>
-            <button
-              className="modal-proceed-btn"
-              disabled={connectedCount === 0}
-              onClick={handleProceed}
-              style={{ opacity: connectedCount === 0 ? 0.45 : 1 }}
-            >
-              {allConnected ? 'Launch Real Dashboard' : connectedCount > 0 ? `Continue with ${connectedCount} account${connectedCount>1?'s':''}` : 'Connect at least one account'}
-            </button>
+          <div style={{ marginTop: 18, padding: '12px 16px', background: 'rgba(34,197,94,0.06)', borderRadius: 8, border: '0.5px solid rgba(34,197,94,0.2)' }}>
+            <div style={{ fontWeight: 600, marginBottom: 4, fontSize: 12, color: '#16a34a' }}>🛡️ Admin-Managed Security</div>
+            <div style={{ fontSize: 12, color: 'var(--text2)', lineHeight: 1.6 }}>
+              Cloud credentials are managed exclusively by your administrator via the Admin Portal. Assigned accounts are connected automatically.
+            </div>
           </div>
         </div>
       </div>
