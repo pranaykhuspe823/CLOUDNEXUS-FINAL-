@@ -1845,7 +1845,8 @@ const GCP_MACHINE_SPECS = {
 class GCPService {
   constructor(credentials) {
     this.creds = credentials;
-    this.projectId = credentials.projectId;
+    // Prefer project_id from the SA JSON (authoritative); fall back to projectId from the form
+    this.projectId = credentials.project_id || credentials.projectId;
     this.auth = null;
     this._machineTypeCache = {};
   }
@@ -1853,11 +1854,32 @@ class GCPService {
   async getAuth() {
     if (this.auth) return this.auth;
     if (this.creds.authType === 'serviceAccount') {
+      // Format: explicit authType with serviceAccountKey
       let keyData;
       try {
         keyData = typeof this.creds.serviceAccountKey === 'string'
           ? JSON.parse(this.creds.serviceAccountKey)
           : this.creds.serviceAccountKey;
+      } catch {
+        throw new Error('Invalid service account JSON');
+      }
+      this.auth = new google.auth.GoogleAuth({
+        credentials: keyData,
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+      });
+    } else if (this.creds.type === 'service_account' && this.creds.private_key && this.creds.client_email) {
+      // Format: admin portal expanded the SA JSON directly into creds object
+      this.auth = new google.auth.GoogleAuth({
+        credentials: this.creds,
+        scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+      });
+    } else if (this.creds.serviceAccountJson) {
+      // Format: SA JSON stored as a string under serviceAccountJson
+      let keyData;
+      try {
+        keyData = typeof this.creds.serviceAccountJson === 'string'
+          ? JSON.parse(this.creds.serviceAccountJson)
+          : this.creds.serviceAccountJson;
       } catch {
         throw new Error('Invalid service account JSON');
       }
@@ -4522,15 +4544,17 @@ function resolveOrgAdmin(userEmail) {
 }
 
 // Accounts a uid may access: the org admin sees every active account in
-// their org; everyone else sees only accounts they've been explicitly assigned to.
+// their org (one per provider — the primary or first); regular users see only
+// their primary (or first) assigned account per provider.
 function getAccessibleAccounts(uid) {
   const email = (uid || '').toLowerCase().trim();
   if (!email) return [];
   const orgAdmin = resolveOrgAdmin(email);
   if (orgAdmin && orgAdmin === email) {
-    try { return db.listCloudAccounts(orgAdmin).filter(a => a.status === 'active'); } catch { return []; }
+    // Admin: all their accounts, but enforce one-per-provider (primary or first)
+    try { return db.getActiveAccountsForUser(email); } catch { return []; }
   }
-  try { return db.listAccountsForUser(email); } catch { return []; }
+  try { return db.getActiveAccountsForUser(email); } catch { return []; }
 }
 
 function hasAccountAccess(uid, account) {
@@ -5374,12 +5398,7 @@ app.post('/api/admin/cloud-accounts', requireOrgAdmin, async (req, res) => {
   if (!label || !credentials) return res.status(400).json({ error: 'label and credentials are required' });
 
   try {
-    const result = await verifyProviderCreds(provider, credentials);
-    if (!result.success) return res.status(401).json({ success: false, error: result.error });
-
-    const { success, ...identity } = result;
-    const accountMeta = { ...(meta || {}), ...identity };
-    const accountId = db.createCloudAccount(req.orgAdmin, provider, label, credentials, accountMeta, req.callerEmail);
+    const accountId = db.createCloudAccount(req.orgAdmin, provider, label, credentials, meta || {}, req.callerEmail);
     db.grantAccountAccess(accountId, req.orgAdmin, req.callerEmail);
     db.addLog(req.callerEmail, `create_cloud_account_${provider}`, 'monitoring', provider, { accountId, label }, req.orgAdmin);
 
@@ -5396,20 +5415,8 @@ app.put('/api/admin/cloud-accounts/:accountId', requireOrgAdmin, async (req, res
   if (!account || account.orgAdmin !== req.orgAdmin) return res.status(404).json({ error: 'not_found' });
 
   const { label, credentials, meta, status } = req.body || {};
-  let newMeta = meta;
 
-  if (credentials) {
-    try {
-      const result = await verifyProviderCreds(account.provider, credentials);
-      if (!result.success) return res.status(401).json({ success: false, error: result.error });
-      const { success, ...identity } = result;
-      newMeta = { ...(meta || account.accountMeta || {}), ...identity };
-    } catch (e) {
-      return res.status(500).json({ success: false, error: e.message });
-    }
-  }
-
-  db.updateCloudAccount(account.id, { label, creds: credentials, meta: newMeta, status });
+  db.updateCloudAccount(account.id, { label, creds: credentials, meta: meta || account.accountMeta, status });
   db.addLog(req.callerEmail, 'update_cloud_account', 'monitoring', account.provider, { accountId: account.id }, req.orgAdmin);
 
   if (credentials) {
@@ -5428,6 +5435,39 @@ app.delete('/api/admin/cloud-accounts/:accountId', requireOrgAdmin, (req, res) =
   accountCaches.delete(String(account.id));
   io.to(`account:${account.id}`).emit('account:deleted', { accountId: account.id });
   db.addLog(req.callerEmail, 'delete_cloud_account', 'monitoring', account.provider, { accountId: account.id }, req.orgAdmin);
+
+  res.json({ success: true });
+});
+
+// Get the primary account ID for a user+provider
+app.get('/api/admin/cloud-accounts/primary', requireOrgAdmin, (req, res) => {
+  const { userEmail, provider } = req.query;
+  if (!userEmail || !provider) return res.status(400).json({ error: 'userEmail and provider are required' });
+  const accountId = db.getUserPrimaryAccountId(userEmail, provider);
+  res.json({ accountId: accountId || null });
+});
+
+// Set the active (primary) account for a specific user+provider
+app.post('/api/admin/cloud-accounts/:accountId/set-primary', requireOrgAdmin, (req, res) => {
+  const account = db.getCloudAccount(req.params.accountId);
+  if (!account || account.orgAdmin !== req.orgAdmin) return res.status(404).json({ error: 'not_found' });
+
+  const { userEmail } = req.body || {};
+  if (!userEmail) return res.status(400).json({ error: 'userEmail is required' });
+  if (!db.isUserAssignedToAccount(userEmail, account.id)) {
+    return res.status(403).json({ error: 'User is not assigned to this account' });
+  }
+
+  db.setUserPrimaryAccount(userEmail, account.provider, account.id);
+  db.addLog(req.callerEmail, 'set_primary_cloud_account', 'monitoring', account.provider,
+    { accountId: account.id, userEmail }, req.orgAdmin);
+
+  io.emit('account:switched', {
+    email:     (userEmail || '').toLowerCase(),
+    provider:  account.provider,
+    accountId: account.id,
+    label:     account.label,
+  });
 
   res.json({ success: true });
 });
@@ -6064,7 +6104,8 @@ io.on('connection', socket => {
   // Admin switches a cloud account for a specific user → broadcast so the user's
   // frontend can show a notification and reload their tool iframe.
   socket.on('admin:switch-account', ({ targetEmail, provider, accountId, label }) => {
-    if (!targetEmail) return;
+    if (!targetEmail || !provider || !accountId) return;
+    try { db.setUserPrimaryAccount(targetEmail, provider, accountId); } catch {}
     io.emit('account:switched', {
       email: targetEmail.toLowerCase(),
       provider,
@@ -6086,6 +6127,31 @@ cron.schedule('*/5 * * * *', () => {
 });
 
 // â”€â”€â”€ Start â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Auto-start billing Python backend ────────────────────────────────────
+(function startBillingBackend() {
+  const { spawn } = require('child_process');
+  const billingDir = require('path').join(__dirname, '..', '..', '..', 'Billing tool', 'Cloudnexus-billing-main', 'backend');
+  function launch() {
+    const proc = spawn('python', ['-m', 'uvicorn', 'main:app', '--host', '127.0.0.1', '--port', '8001'], {
+      cwd: billingDir,
+      stdio: 'ignore',
+      detached: false,
+    });
+    proc.on('exit', (code) => {
+      if (code !== 0) {
+        logger.warn(`Billing backend exited (code ${code}), restarting in 5s…`);
+        setTimeout(launch, 5000);
+      }
+    });
+    proc.on('error', (e) => {
+      logger.error(`Billing backend spawn error: ${e.message}, retrying in 5s…`);
+      setTimeout(launch, 5000);
+    });
+    logger.info('Billing backend started on port 8001');
+  }
+  launch();
+})();
+
 // ── Start with DB init + session restore ─────────────────────────────────
 db.initDB().then(() => {
   // Purge users whose 7-day restore window has expired

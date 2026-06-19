@@ -7,7 +7,7 @@ import os, sys
 import smtplib
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '..', '..', '.env'))
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from time import time
@@ -81,6 +81,14 @@ def _get_account_creds(account_id: int) -> Optional[Dict]:
         auth_type = creds.pop("auth_type", None) or (
             "service_account" if account["provider"] == "gcp" else "iam"
         )
+        # Normalize camelCase AWS keys to snake_case expected by boto3 calls
+        if account["provider"] == "aws":
+            if "accessKeyId" in creds and "access_key_id" not in creds:
+                creds["access_key_id"] = creds.pop("accessKeyId")
+            if "secretAccessKey" in creds and "secret_access_key" not in creds:
+                creds["secret_access_key"] = creds.pop("secretAccessKey")
+            if "sessionToken" in creds and "session_token" not in creds:
+                creds["session_token"] = creds.pop("sessionToken")
         return {"auth_type": auth_type, "creds": creds, "meta": account.get("accountMeta") or {}}
     except Exception as e:
         print(f"[billing] _get_account_creds({account_id}) error: {e}")
@@ -95,9 +103,11 @@ def _build_org_creds_for_uid(uid: str) -> Dict[str, Dict]:
     if not uid or not _db_available:
         return {}
     try:
-        org_admin = get_org_admin_for_user(uid.lower().strip())
-        is_admin  = bool(org_admin) and org_admin == uid.lower().strip()
-        accounts  = list_accounts_for_org(org_admin) if is_admin else list_accounts_for_user(uid.lower().strip())
+        # Try user-assigned accounts first (regular users assigned via admin portal)
+        accounts = list_accounts_for_user(uid.lower().strip())
+        # If no assigned accounts, try org-owned accounts (admin viewing own org)
+        if not accounts:
+            accounts = list_accounts_for_org(uid.lower().strip())
     except Exception:
         return {}
     seen: Dict[str, Dict] = {}
@@ -116,6 +126,18 @@ def _invalidate_real_cache(uid: str = None) -> None:
         _real_data_cache.pop((uid or "").lower().strip(), None)
     else:
         _real_data_cache.clear()
+
+
+def _get_hot_cache_only(uid: str) -> Optional[dict]:
+    """Return cached data if fresh — never blocks, never fetches cloud APIs."""
+    key = (uid or "").lower().strip()
+    now = time()
+    cached = _real_data_cache.get(key)
+    if cached is not None:
+        data, ts = cached
+        if now - ts < _REAL_DATA_CACHE_TTL:
+            return data
+    return None
 
 
 def _get_cached_real_data(uid: str = "") -> dict:
@@ -590,9 +612,9 @@ def credentials_status(uid: str = ""):
     if not _db_available:
         return {p: {"connected": False, "auth_type": None} for p in ["aws", "gcp", "azure"]}
     try:
-        org_admin = get_org_admin_for_user(uid.lower().strip()) if uid else ""
-        is_admin  = bool(org_admin) and org_admin == (uid or "").lower().strip()
-        accounts  = list_accounts_for_org(org_admin) if is_admin else list_accounts_for_user((uid or "").lower().strip())
+        accounts = list_accounts_for_user((uid or "").lower().strip())
+        if not accounts:
+            accounts = list_accounts_for_org((uid or "").lower().strip())
     except Exception:
         accounts = []
     by_provider: Dict[str, Dict] = {}
@@ -745,11 +767,39 @@ def _get_data(mode: str, uid: str = "") -> dict:
 
 @app.get("/api/overview")
 def overview(mode: str = "mock", uid: str = ""):
+    # In real mode: use hot cache first to avoid blocking; background fetch warms cache
+    if mode == "real":
+        cached = _get_hot_cache_only(uid)
+        if cached is not None:
+            return cached["overview"]
+        # Cache cold — trigger background warm and return mock overview immediately
+        threading.Thread(target=_get_cached_real_data, args=(uid,), daemon=True).start()
+        try:
+            from mock_data import get_mock_data
+        except ModuleNotFoundError:
+            from .mock_data import get_mock_data
+        return get_mock_data()["overview"]
     return _get_data(mode, uid)["overview"]
 
 
 @app.get("/api/provider/{provider}")
 def provider_data(provider: str, mode: str = "mock", uid: str = ""):
+    if mode == "real":
+        cached = _get_hot_cache_only(uid)
+        if cached is not None:
+            pdata = cached["providers"].get(provider)
+            if pdata:
+                return pdata
+        # Cache cold — return mock provider data; overview endpoint already kicked off warm
+        try:
+            from mock_data import get_mock_data
+        except ModuleNotFoundError:
+            from .mock_data import get_mock_data
+        pdata = get_mock_data()["providers"].get(provider)
+        if not pdata:
+            raise HTTPException(status_code=404, detail=f"Provider {provider} not found")
+        pdata["_warming"] = True
+        return pdata
     data = _get_data(mode, uid)
     pdata = data["providers"].get(provider)
     if not pdata:
@@ -759,27 +809,54 @@ def provider_data(provider: str, mode: str = "mock", uid: str = ""):
 
 @app.get("/api/trend")
 def trend(mode: str = "mock", days: int = 90, uid: str = ""):
+    if mode == "real":
+        cached = _get_hot_cache_only(uid)
+        if cached is not None:
+            return cached["trend"][-days:]
+        try:
+            from mock_data import get_mock_data
+        except ModuleNotFoundError:
+            from .mock_data import get_mock_data
+        return get_mock_data()["trend"][-days:]
     return _get_data(mode, uid)["trend"][-days:]
 
 
 @app.get("/api/analysis")
-def analysis(mode: str = "real", uid: str = "", account_id: Optional[int] = None):
-    err = check_account_access_response(uid, account_id)
-    if err is not None:
-        return err
-    org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
+def analysis(mode: str = "real", uid: str = ""):
     try:
         if mode == "mock":
             payload = analyze_cross_cloud({})
             payload["source"] = "mock"
             return payload
-        payload = analyze_cross_cloud(org_creds)
+
+        org_creds = _build_org_creds_for_uid(uid) if mode == "real" else {}
+
+        # Only read from hot cache — never block on cloud API calls here.
+        # The main dashboard endpoints (overview/provider/trend) already populate the cache.
+        # If cache is cold (user opened analysis before dashboard loaded), return mock
+        # immediately so the UI is responsive; a subsequent refresh will use real data.
+        cached_data = _get_hot_cache_only(uid) if org_creds else None
+
+        if cached_data is not None:
+            payload = analyze_cross_cloud(org_creds, cached_data=cached_data)
+        else:
+            # Cache not ready yet — use mock so the UI loads instantly
+            payload = analyze_cross_cloud({})
+            payload["source"] = "warming"
+
         return payload
     except Exception as e:
-        payload = analyze_cross_cloud({})
-        payload["source"] = "mock"
-        payload["error"] = str(e)
-        return payload
+        # Ensure the fallback itself can't crash the endpoint
+        try:
+            fb = analyze_cross_cloud({})
+            fb["source"] = "mock"
+            fb["error"] = str(e)
+            return fb
+        except Exception:
+            return {
+                "source": "mock", "error": str(e),
+                "cards": {}, "recommendations": [], "tips": [],
+            }
 
 
 @app.get("/api/forecast")
@@ -787,32 +864,81 @@ def forecast(mode: str = "mock", uid: str = ""):
     """
     Run ensemble forecast (Holt-Winters + LSTM + XGBoost + Claude AI) over
     the actual trend history — mock or live.  No hardcoded forecast values.
+    Always returns data for all three providers (AWS, GCP, Azure).
     """
-    data    = _get_data(mode, uid)
+    # Use hot-cache for real mode to avoid blocking on cloud APIs
+    if mode == "real":
+        cached = _get_hot_cache_only(uid)
+        if cached is not None:
+            data = cached
+        else:
+            # No warm cache yet — fall through to mock so we don't block
+            try:
+                from mock_data import get_mock_data
+            except ModuleNotFoundError:
+                from .mock_data import get_mock_data
+            data = get_mock_data()
+    else:
+        data = _get_data(mode, uid)
+
     history = [d["total"] for d in data["trend"]]
     if not history:
         raise HTTPException(status_code=422, detail="No trend data available for forecasting")
-    result = run_forecast(history)
-    # Attach per-provider shares for frontend to use
+    # Strip leading zeros — they corrupt Holt-Winters initialisation
+    first_real = next((i for i, v in enumerate(history) if v > 0), None)
+    if first_real is not None and first_real > 0:
+        history = history[first_real:]
+    if not history or all(v == 0 for v in history):
+        raise HTTPException(status_code=422, detail="No non-zero cost data found for forecasting")
+
     trend_data = data["trend"]
-    if trend_data:
-        recent = trend_data[-30:]
-        totals = {"aws": 0, "gcp": 0, "azure": 0, "total": 0}
-        for d in recent:
-            for k in totals:
-                totals[k] += d.get(k, 0)
-        grand = totals["total"] or 1
-        result["provider_shares"] = {
-            "aws":   round(totals["aws"]   / grand, 4),
-            "gcp":   round(totals["gcp"]   / grand, 4),
-            "azure": round(totals["azure"] / grand, 4),
-        }
-        # Per-provider history arrays for the chart (last 30 days)
-        result["provider_history"] = {
-            "aws":   [d.get("aws", 0)   for d in recent],
-            "gcp":   [d.get("gcp", 0)   for d in recent],
-            "azure": [d.get("azure", 0) for d in recent],
-        }
+    recent     = trend_data[-30:] if len(trend_data) >= 30 else trend_data
+
+    # ── Provider shares — always fill all three providers ─────────────
+    # First try from trend data (accurate when all providers have history)
+    trend_totals = {"aws": 0, "gcp": 0, "azure": 0, "total": 0}
+    for d in recent:
+        for k in trend_totals:
+            trend_totals[k] += d.get(k, 0)
+    trend_grand = trend_totals["total"] or 1
+
+    # For providers missing from trend, use MTD from providers block
+    providers_block = data.get("providers", {})
+    mtd_totals = {
+        p: (providers_block.get(p) or {}).get("mtd", 0)
+        for p in ("aws", "gcp", "azure")
+    }
+    mtd_grand = sum(mtd_totals.values()) or 1
+
+    raw_shares: dict = {}
+    for p in ("aws", "gcp", "azure"):
+        trend_share = trend_totals[p] / trend_grand
+        if trend_share > 0.005:
+            raw_shares[p] = trend_share
+        else:
+            # Provider absent from trend — estimate from MTD
+            raw_shares[p] = mtd_totals[p] / mtd_grand if mtd_totals[p] > 0 else 0
+
+    # Ensure all three are present; if all zero default to equal thirds
+    if all(v == 0 for v in raw_shares.values()):
+        raw_shares = {"aws": 0.6, "gcp": 0.25, "azure": 0.15}
+
+    # Normalise to sum to 1
+    shares_sum = sum(raw_shares.values()) or 1
+    provider_shares = {k: round(v / shares_sum, 4) for k, v in raw_shares.items()}
+
+    # ── Per-provider history — estimate from total × share when missing ─
+    provider_history: dict = {}
+    for p in ("aws", "gcp", "azure"):
+        raw_hist = [d.get(p, 0) for d in recent]
+        if all(v == 0 for v in raw_hist) and provider_shares[p] > 0:
+            # No per-provider trend data — scale total by share for chart continuity
+            raw_hist = [round(d.get("total", 0) * provider_shares[p], 2) for d in recent]
+        provider_history[p] = raw_hist
+
+    result = run_forecast(history, provider_shares=provider_shares)
+    result["provider_shares"]  = provider_shares
+    result["provider_history"] = provider_history
     return result
 
 
@@ -849,33 +975,130 @@ def export_json(mode: str = "mock", uid: str = ""):
 
 # ── INVOICES ──────────────────────────────────────────────────────────
 
+def _build_invoices_from_cached_trend(provider: str, cached: dict) -> list:
+    """
+    Build real monthly invoices by aggregating daily trend data from the hot cache.
+    Used when the cloud-native invoice API is unavailable (e.g. GCP, Azure).
+    Trend entries have format {"date": "Jun 19", "aws": 592, "gcp": 481, ...}.
+    """
+    pdata = (cached.get("providers") or {}).get(provider, {})
+    if not pdata or pdata.get("_not_connected"):
+        return []
+
+    trend  = cached.get("trend", [])
+    today  = datetime.utcnow()
+
+    # Build a lookup of "Mon DD" → datetime for the last 90 days so we can
+    # resolve ambiguous month-day strings to the correct calendar year.
+    valid_dates: dict = {}
+    for i in range(91):
+        d = today - timedelta(days=i)
+        valid_dates[d.strftime("%b %d")] = d
+        valid_dates[d.strftime("%b  %d")] = d  # handle single-digit day with extra space
+
+    # Aggregate daily provider spend by calendar month
+    monthly_totals: dict = {}  # "Jun 2026" → float
+    for entry in trend:
+        date_str = (entry.get("date") or "").strip()
+        val = float(entry.get(provider, 0) or 0)
+        if not date_str or val == 0:
+            continue
+        dt = valid_dates.get(date_str)
+        if dt is None:
+            continue
+        key = dt.strftime("%b %Y")
+        monthly_totals[key] = monthly_totals.get(key, 0.0) + val
+
+    # Override current month with MTD from providers block (more accurate)
+    mtd  = float(pdata.get("mtd", 0) or 0)
+    svcs = pdata.get("services", [])
+    cur_key = today.strftime("%b %Y")
+    if mtd > 0.01:
+        monthly_totals[cur_key] = mtd
+
+    if not monthly_totals:
+        return []
+
+    due_offset = {"aws": 15, "gcp": 20, "azure": 25}.get(provider, 20)
+    invoices   = []
+
+    def _month_dt(mk):
+        try:    return datetime.strptime(mk, "%b %Y")
+        except: return datetime.min
+
+    for month_key in sorted(monthly_totals, key=_month_dt, reverse=True):
+        amount = monthly_totals[month_key]
+        if amount < 0.01:
+            continue
+        month_start = _month_dt(month_key)
+        if month_start.month == 12:
+            month_end = month_start.replace(year=month_start.year + 1, month=1, day=1)
+        else:
+            month_end = month_start.replace(month=month_start.month + 1, day=1)
+
+        is_current = (month_key == cur_key)
+        status     = "pending" if is_current else "paid"
+        items      = []
+        if is_current and svcs:
+            items = [{"service": s["name"], "qty": f"{today.day} days MTD",
+                      "unit":  round(s.get("cost", 0), 2),
+                      "total": round(s.get("cost", 0), 2)} for s in svcs[:10]]
+
+        invoices.append({
+            "id":     f"INV-{provider.upper()}-{month_start.strftime('%Y-%m')}",
+            "period": month_key,
+            "issued": month_end.strftime("%Y-%m-%d"),
+            "due":    month_end.replace(day=min(due_offset, 28)).strftime("%Y-%m-%d"),
+            "amount": round(amount, 2),
+            "status": status,
+            "items":  items,
+            "source": "live",
+            "note":   ("Month-to-date spend" if is_current
+                       else "Aggregated from daily billing data"),
+        })
+
+    return invoices[:6]
+
+
 @app.get("/api/invoices/{provider}")
-def get_invoices(provider: str, mode: str = "mock", uid: str = "", account_id: Optional[int] = None):
-    err = check_account_access_response(uid, account_id)
-    if err is not None:
-        return err
-    try:
-        from real_data import get_real_invoices
-    except ModuleNotFoundError:
-        from .real_data import get_real_invoices
-    org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
-    provider  = provider.lower()
+def get_invoices(provider: str, mode: str = "mock", uid: str = ""):
+    provider = provider.lower()
     if provider not in ["aws", "gcp", "azure"]:
         raise HTTPException(status_code=400, detail="Invalid provider")
 
-    if mode == "real" and org_creds:
-        live = get_real_invoices(provider, org_creds)
-        if live:
-            return {"source": "live", "invoices": live}
+    if mode == "real":
+        org_creds = _build_org_creds_for_uid(uid)
 
-    # Fallback: derive mock invoices from live trend data (no hardcoded amounts)
+        # 1. Try cloud-native invoice API (AWS Cost Explorer gives full detail)
+        if org_creds:
+            try:
+                from real_data import get_real_invoices
+            except ModuleNotFoundError:
+                from .real_data import get_real_invoices
+            live = get_real_invoices(provider, org_creds)
+            if live:
+                return {"source": "live", "invoices": live}
+
+        # 2. Build from cached real daily spend — covers GCP and Azure
+        cached = _get_hot_cache_only(uid)
+        if cached:
+            trend_invs = _build_invoices_from_cached_trend(provider, cached)
+            if trend_invs:
+                return {"source": "live", "invoices": trend_invs}
+
+        # 3. Cache is cold — kick off background warm; return empty (never mock in real mode)
+        if not cached and org_creds:
+            import threading
+            threading.Thread(target=_get_cached_real_data, args=(uid,), daemon=True).start()
+
+        return {"source": "real", "invoices": []}
+
+    # ── Mock mode ─────────────────────────────────────────────────────────
     data  = _get_data(mode, uid)
     pdata = data["providers"].get(provider, {})
     mtd   = pdata.get("mtd", 0)
     svcs  = pdata.get("services", [])
     today = datetime.utcnow()
-
-    # Build 6-month history from trend data
     trend = data.get("trend", [])
 
     def make_invoice(months_ago, status):
@@ -884,20 +1107,11 @@ def get_invoices(provider: str, mode: str = "mock", uid: str = "", account_id: O
             month_end = month_start.replace(year=month_start.year+1, month=1, day=1)
         else:
             month_end = month_start.replace(month=month_start.month+1, day=1)
-
-        # Compute amount from trend data for that month, falling back to mtd with decay
         month_label = month_start.strftime("%b")
         month_trend = [d for d in trend if d.get("date", "").startswith(month_label)]
-        if month_trend:
-            # Sum provider's daily costs for that month from trend
-            share_key = provider
-            amount = round(sum(d.get(share_key, 0) for d in month_trend), 2)
-        else:
-            amount = round(mtd * (0.95 ** months_ago), 2)
-
+        amount = round(sum(d.get(provider, 0) for d in month_trend), 2) if month_trend else 0
         if amount == 0:
             amount = round(mtd * (0.95 ** months_ago), 2)
-
         due_offsets = {"aws": 15, "gcp": 20, "azure": 25}
         items = [{"service": s["name"], "qty": "1 month",
                   "unit": round(s["cost"] * (0.95 ** months_ago), 2),
@@ -921,10 +1135,7 @@ def get_invoices(provider: str, mode: str = "mock", uid: str = "", account_id: O
 # ── MONTHLY TREND ──────────────────────────────────────────────────────
 
 @app.get("/api/trend/monthly")
-def monthly_trend(mode: str = "mock", uid: str = "", account_id: Optional[int] = None):
-    err = check_account_access_response(uid, account_id)
-    if err is not None:
-        return err
+def monthly_trend(mode: str = "mock", uid: str = ""):
     org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
     if mode == "real" and org_creds:
         data = _get_data(mode, uid)
@@ -965,15 +1176,12 @@ def monthly_trend(mode: str = "mock", uid: str = "", account_id: Optional[int] =
 # ── COST COMPARISON (Multi-Cloud FinOps) ──────────────────────────────
 
 @app.get("/api/cost-comparison")
-def cost_comparison(mode: str = "mock", uid: str = "", account_id: Optional[int] = None):
+def cost_comparison(mode: str = "mock", uid: str = ""):
     """
     Multi-cloud cost comparison payload: provider stats, radar, monthly history,
     budget analysis, savings recommendations, and cross-service table.
     Mirrors the Cost Analyst v2 comparison feature.
     """
-    err = check_account_access_response(uid, account_id)
-    if err is not None:
-        return err
     try:
         from cost_comparison import build_comparison_payload
     except ModuleNotFoundError:
@@ -1022,15 +1230,12 @@ def cost_comparison(mode: str = "mock", uid: str = "", account_id: Optional[int]
 # ── ALL RESOURCES — full inventory from every connected provider ────────
 
 @app.get("/api/all-resources")
-def all_resources_endpoint(mode: str = "mock", uid: str = "", account_id: Optional[int] = None):
+def all_resources_endpoint(mode: str = "mock", uid: str = ""):
     """
     Returns every provisioned resource (EC2, RDS, S3, Lambda, EKS, ECS,
     Azure VMs, Storage Accounts, GCP Compute) with type, state, region.
     Real mode uses live cloud APIs; mock mode derives from billing services.
     """
-    err = check_account_access_response(uid, account_id)
-    if err is not None:
-        return err
     org_creds = _build_org_creds_for_uid(uid) if mode != "mock" else {}
     if mode == "real" and org_creds:
         data = _get_cached_real_data(uid)
@@ -1063,14 +1268,11 @@ def all_resources_endpoint(mode: str = "mock", uid: str = "", account_id: Option
 # ── NAMED RESOURCES — real user-defined names + specs ─────────────────
 
 @app.get("/api/resources/named")
-def named_resources(mode: str = "real", uid: str = "", account_id: Optional[int] = None):
+def named_resources(mode: str = "real", uid: str = ""):
     """
     Return all resources with user-defined names and full specs
     from every connected cloud provider.
     """
-    err = check_account_access_response(uid, account_id)
-    if err is not None:
-        return err
     try:
         from real_data import get_named_resources
     except ModuleNotFoundError:

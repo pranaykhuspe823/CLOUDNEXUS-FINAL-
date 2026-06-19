@@ -25,20 +25,28 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
-def _build_monthly_history(provider: str, months: int = 6) -> list:
-    """Deterministic per-provider monthly history (mirrors Cost Analyst logic)."""
-    base = {"aws": 22000, "gcp": 12000, "azure": 7000}.get(provider, 5000)
+def _build_monthly_history(provider: str, months: int = 6, current_mtd: float = 0) -> list:
+    """
+    Generate per-provider monthly history.
+    When current_mtd > 0, derives full-month from current spend and projects
+    previous months backwards with a small trend; otherwise uses safe placeholder values.
+    """
     today = datetime.date.today()
+    days_elapsed = max(today.day, 1)
+    # Project current MTD to a full-month estimate
+    if current_mtd > 0:
+        full_month_est = current_mtd * (30 / days_elapsed)
+    else:
+        full_month_est = {"aws": 4200, "gcp": 2000, "azure": 1200}.get(provider, 800)
     hist = []
     for i in range(months):
         d = today - datetime.timedelta(days=(months - 1 - i) * 30)
         label = d.strftime("%b %Y")
         seed = d.toordinal() + (0 if provider == "aws" else 111 if provider == "gcp" else 222)
         noise = (math.sin(seed * 1.3) + 1) / 2
-        trend_mult = 1 + (i / max(months - 1, 1)) * (
-            0.18 if provider == "aws" else (0.10 if provider == "azure" else -0.06)
-        )
-        cost = int(base * trend_mult / months + noise * base * 0.06)
+        # Most recent month → full_month_est; earlier months slightly lower
+        age_factor = 1 - ((months - 1 - i) / max(months - 1, 1)) * 0.12
+        cost = int(full_month_est * age_factor + noise * full_month_est * 0.06)
         hist.append({"label": label, "month": label, "cost": cost})
     return hist
 
@@ -239,8 +247,11 @@ def build_comparison_payload(
             for m in real_monthly
         ]
     else:
-        months_history = _build_monthly_history
-        hist = {p: months_history(p, months) for p in ("aws", "gcp", "azure")}
+        hist = {
+            p: _build_monthly_history(p, months,
+                                      current_mtd=_safe_float(providers_info.get(p, {}).get("mtd", 0)))
+            for p in ("aws", "gcp", "azure")
+        }
         monthly_comparison = []
         for i in range(months):
             monthly_comparison.append({

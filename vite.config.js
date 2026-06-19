@@ -2,7 +2,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig(({ command }) => ({
-  base: command === 'build' ? '/CLOUDNEXUS-FINAL-/' : '/',
+  base: '/',
   plugins: [react()],
   server: {
     port: 3006,
@@ -12,10 +12,12 @@ export default defineConfig(({ command }) => ({
     proxy: {
       // Billing API must come before /billing to take priority
       '/billing/api': { target: 'http://localhost:3001', changeOrigin: true },
-      // Billing frontend (served with base: '/billing/')
-      '/billing':     { target: 'http://localhost:3008', changeOrigin: true },
-      // Monitoring frontend (served with base: '/monitor/')
-      '/monitor':     { target: 'http://localhost:3007', changeOrigin: true },
+      // Billing frontend assets (trailing slash = only match /billing/... paths,
+      // not the bare /billing SPA route so that F5-refresh falls through to this app)
+      '/billing/':    { target: 'http://localhost:3008', changeOrigin: true },
+      // Monitoring frontend assets (same rationale — /monitor/ matches tool assets,
+      // /monitoring SPA route is not caught by this proxy)
+      '/monitor/':    { target: 'http://localhost:3007', changeOrigin: true },
       // Shared backend routes
       '/api':         { target: 'http://localhost:3001', changeOrigin: true },
       '/auth':        { target: 'http://localhost:3001', changeOrigin: true },

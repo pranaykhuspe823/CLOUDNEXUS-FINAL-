@@ -21,8 +21,8 @@ export function useCloudData(mode) {
         fetchProvider('gcp', mode),
         fetchProvider('azure', mode),
         fetchTrend(mode, 90),
-        fetchForecast(mode),
-        fetchAlerts(mode),
+        fetchForecast(mode).catch(() => null),   // 422 when no cost data yet — don't fail all
+        fetchAlerts(mode).catch(() => []),
       ]);
       setOverview(ov);
       setProviders({ aws, gcp, azure });

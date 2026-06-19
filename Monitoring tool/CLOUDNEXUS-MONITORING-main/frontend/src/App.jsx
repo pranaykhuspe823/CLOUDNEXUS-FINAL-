@@ -156,6 +156,14 @@ export default function App() {
     },
     onAlertsUpdated: (alerts) => setRealAlerts(alerts),
     onTopologyUpdated: (topology) => setRealTopology(topology),
+    onAccountSwitched: ({ email: targetEmail, provider }) => {
+      const uid = localStorage.getItem('cn_tool_uid') || '';
+      if (!uid || !targetEmail || uid.toLowerCase() !== targetEmail.toLowerCase()) return;
+      // Clear this provider's data and trigger a fresh fetch via reconnect
+      setRealData(prev => ({ ...prev, [provider]: [] }));
+      setFetchingProviders(prev => ({ ...prev, [provider]: true }));
+      setTimeout(() => window.location.reload(), 800);
+    },
     onSessionRevoked: ({ email, sessionId: winningSessionId, reason }) => {
       const uid = localStorage.getItem('cn_tool_uid') || new URLSearchParams(window.location.search).get('uid');
       if (!uid || !email || uid.toLowerCase() !== email.toLowerCase()) return;

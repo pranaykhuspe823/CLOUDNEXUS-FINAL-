@@ -146,6 +146,17 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_cloud_account_access_user ON cloud_account_access(user_email);
   `);
 
+  // ── Active account per user per provider ──────────────────────────────────
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS user_primary_accounts (
+      user_email TEXT NOT NULL,
+      provider   TEXT NOT NULL,
+      account_id INTEGER NOT NULL,
+      set_at     TEXT DEFAULT (datetime('now')),
+      PRIMARY KEY (user_email, provider)
+    );
+  `);
+
   // ── Account activation tokens ─────────────────────────────────────────────
   _db.run(`
     CREATE TABLE IF NOT EXISTS activation_tokens (
@@ -679,6 +690,54 @@ function listAllActiveCloudAccounts() {
   return rows.map(_accountRow);
 }
 
+// ── Primary (active) account per user per provider ────────────────────────
+
+function setUserPrimaryAccount(userEmail, provider, accountId) {
+  const email = (userEmail || '').toLowerCase().trim();
+  _db.run(
+    `INSERT INTO user_primary_accounts (user_email, provider, account_id, set_at)
+     VALUES (?, ?, ?, datetime('now'))
+     ON CONFLICT(user_email, provider) DO UPDATE SET account_id=excluded.account_id, set_at=excluded.set_at`,
+    [email, provider, accountId]
+  );
+  _persist();
+}
+
+function getUserPrimaryAccountId(userEmail, provider) {
+  const email = (userEmail || '').toLowerCase().trim();
+  const rows = _rows(_db.exec(
+    'SELECT account_id FROM user_primary_accounts WHERE LOWER(user_email)=? AND provider=?',
+    [email, provider]
+  ));
+  return rows[0]?.account_id ?? null;
+}
+
+// Returns one active account per provider for a user.
+// Respects the user's primary selection; auto-picks the first assigned if not set.
+function getActiveAccountsForUser(userEmail) {
+  const email = (userEmail || '').toLowerCase().trim();
+  const all = _rows(_db.exec(
+    `SELECT ca.* FROM cloud_accounts ca
+     JOIN cloud_account_access a ON a.account_id=ca.id
+     WHERE LOWER(a.user_email)=? AND ca.status='active'
+     ORDER BY ca.created_at ASC`,
+    [email]
+  )).map(_accountRow);
+
+  const byProvider = {};
+  for (const acc of all) {
+    if (!byProvider[acc.provider]) byProvider[acc.provider] = acc;
+  }
+  for (const provider of Object.keys(byProvider)) {
+    const primaryId = getUserPrimaryAccountId(email, provider);
+    if (primaryId) {
+      const primary = all.find(a => a.id === primaryId);
+      if (primary) byProvider[provider] = primary;
+    }
+  }
+  return Object.values(byProvider);
+}
+
 // Batched per-org lookup for the Users-tab logo badges: for every user in
 // the org, which accounts (id/provider/label) are they assigned to.
 function listOrgUserAccountAccess(orgAdmin) {
@@ -749,6 +808,7 @@ module.exports = {
   createCloudAccount, listCloudAccounts, getCloudAccount, updateCloudAccount, deleteCloudAccount,
   grantAccountAccess, revokeAccountAccess, listAccountAssignments,
   listAccountsForUser, isUserAssignedToAccount, listAllActiveCloudAccounts,
+  setUserPrimaryAccount, getUserPrimaryAccountId, getActiveAccountsForUser,
   listOrgUserAccountAccess,
   createActivationToken, getActivationToken, consumeActivationToken, activateUser,
 };

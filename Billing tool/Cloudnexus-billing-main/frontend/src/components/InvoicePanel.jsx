@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { fmt } from '../utils/theme';
 import ProviderLogo from './ProviderLogo';
 
-const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const BASE = import.meta.env.VITE_API_URL || 'http://localhost:8001';
 
 const PROVIDER_COLORS = { aws: '#FF9900', gcp: '#4285F4', azure: '#008AD7' };
 const PROVIDER_LABELS = { aws: 'Amazon Web Services', gcp: 'Google Cloud Platform', azure: 'Microsoft Azure' };
@@ -174,17 +174,17 @@ function downloadInvoicePDF(inv, provider) {
 }
 
 // ─── MonthlyTrend sub-panel ─────────────────────────────────────────────
-function MonthlyTrendPanel({ mode }) {
+function MonthlyTrendPanel({ mode, uid = '' }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     setLoading(true);
-    fetch(`${BASE}/api/trend/monthly?mode=${mode}`)
+    fetch(`${BASE}/api/trend/monthly?mode=${mode}&uid=${encodeURIComponent(uid)}`)
       .then(r => r.json())
       .then(d => { setData(d); setLoading(false); })
       .catch(() => setLoading(false));
-  }, [mode]);
+  }, [mode, uid]);
 
   if (loading) return <div style={{ textAlign:'center', padding:20, color:'#94a3b8', fontSize:13 }}>Loading monthly data…</div>;
   if (!data) return null;
@@ -234,7 +234,7 @@ function MonthlyTrendPanel({ mode }) {
 
 
 // ─── Main InvoicePanel ──────────────────────────────────────────────────
-export default function InvoicePanel({ mode }) {
+export default function InvoicePanel({ mode, uid = '' }) {
   const [activeProvider, setActiveProvider] = useState('aws');
   const [expandedInvoice, setExpandedInvoice] = useState(null);
   const [invoices, setInvoices] = useState([]);
@@ -246,7 +246,7 @@ export default function InvoicePanel({ mode }) {
     setFetching(true);
     setExpandedInvoice(null);
     try {
-      const res = await fetch(`${BASE}/api/invoices/${activeProvider}?mode=${mode}`);
+      const res = await fetch(`${BASE}/api/invoices/${activeProvider}?mode=${mode}&uid=${encodeURIComponent(uid)}`);
       const data = await res.json();
       setInvoices(data.invoices || []);
       setDataSource(data.source || 'mock');
@@ -256,7 +256,7 @@ export default function InvoicePanel({ mode }) {
     } finally {
       setFetching(false);
     }
-  }, [activeProvider, mode]);
+  }, [activeProvider, mode, uid]);
 
   useEffect(() => { loadInvoices(); }, [loadInvoices]);
 
@@ -284,7 +284,7 @@ export default function InvoicePanel({ mode }) {
       </div>
 
       {view === 'monthly' ? (
-        <MonthlyTrendPanel mode={mode} />
+        <MonthlyTrendPanel mode={mode} uid={uid} />
       ) : (
         <>
           {/* Provider tabs */}
@@ -299,9 +299,11 @@ export default function InvoicePanel({ mode }) {
                 <ProviderLogo provider={p} size={14} />
                 <span>{p.toUpperCase()}</span>
                 {activeProvider === p && (
-                  <span className="inv-fetch-badge" style={{ background: dataSource==='live' ? '#16a34a' : '#94a3b8' }}>
-                    {dataSource === 'live' ? 'Live' : 'Mock'}
-                  </span>
+                  dataSource === 'live'
+                    ? <span className="inv-fetch-badge" style={{ background: '#16a34a' }}>Live</span>
+                    : mode === 'mock'
+                      ? <span className="inv-fetch-badge" style={{ background: '#94a3b8' }}>Mock</span>
+                      : null
                 )}
               </button>
             ))}
@@ -312,7 +314,13 @@ export default function InvoicePanel({ mode }) {
             <div>
               <div className="invoice-provider-name">{PROVIDER_LABELS[activeProvider]}</div>
               <div className="invoice-sub">
-                Billing history · {dataSource === 'live' ? 'Live data from cloud API' : 'Mock data — connect credentials for live'} · {invoices.length} invoices
+                Billing history ·{' '}
+                {dataSource === 'live'
+                  ? 'Live data from cloud API'
+                  : mode === 'mock'
+                    ? 'Mock data — connect credentials for live'
+                    : 'No billing data available for this account'}{' '}
+                · {invoices.length} invoices
               </div>
             </div>
             <div className="invoice-ytd">
@@ -328,7 +336,9 @@ export default function InvoicePanel({ mode }) {
             </div>
           ) : invoices.length === 0 ? (
             <div style={{ textAlign:'center', padding:40, color:'#94a3b8', fontSize:13 }}>
-              No invoice data available. Connect your {activeProvider.toUpperCase()} credentials to load live billing history.
+              {mode === 'real'
+                ? `No invoices found for ${activeProvider.toUpperCase()}. This provider may not have any billing activity yet.`
+                : `No invoice data available. Connect your ${activeProvider.toUpperCase()} credentials to load live billing history.`}
             </div>
           ) : (
             <div className="invoice-list">

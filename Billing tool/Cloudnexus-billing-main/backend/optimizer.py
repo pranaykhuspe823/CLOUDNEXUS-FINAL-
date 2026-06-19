@@ -36,8 +36,8 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 
 def _month_factor() -> int:
-    # Use 30-day month approximation for stable UI.
-    return 30
+    # Use actual days elapsed this month so daily rate is accurate.
+    return max(_now_utc().day, 1)
 
 
 def _unknown_console(cloud: str, region: str, ident: str) -> str:
@@ -164,10 +164,12 @@ def _services_running_cards(
     }
 
 
-def analyze_cross_cloud(credentials: Dict[str, Any]) -> Dict[str, Any]:
+def analyze_cross_cloud(credentials: Dict[str, Any], cached_data: Optional[Dict] = None) -> Dict[str, Any]:
     """Main entry used by FastAPI.
 
     Input is the same in-memory credential dict used by real_data.
+    cached_data: pre-fetched provider data from the real_data cache — avoids a
+    redundant cloud API round-trip when called from the analysis endpoint.
     We do *not* persist credentials.
     """
     # credentials keys: aws/gcp/azure present when connected in frontend flow.
@@ -175,32 +177,22 @@ def analyze_cross_cloud(credentials: Dict[str, Any]) -> Dict[str, Any]:
     gcp_connected = "gcp" in credentials
     azure_connected = "azure" in credentials
 
-    # We do best-effort inventory.
-    # Cost inputs per provider come from existing overview-like data.
-    # For live, real_data already fetches mtd by service. We'll just compute a
-    # service-level running approximation.
-    #
-    # For now, to keep safe and non-invasive, we rely on real_data providers.
-    # Support running server from different working directories.
-    # Try local imports first, then package-relative.
-    try:
-        from real_data import get_real_data
-        from mock_data import get_mock_data
-    except ModuleNotFoundError:
-        from .real_data import get_real_data
-        from .mock_data import get_mock_data
-    # final fallback if import system still can't resolve
-    if 'get_real_data' not in locals():
-        from .real_data import get_real_data
-        from .mock_data import get_mock_data
-
-
-
-
-    if aws_connected or gcp_connected or azure_connected:
+    if cached_data is not None:
+        # Use the pre-fetched cached data — fastest path, no cloud API call needed
+        data = cached_data
+        mode = "real" if (aws_connected or gcp_connected or azure_connected) else "mock"
+    elif aws_connected or gcp_connected or azure_connected:
+        try:
+            from real_data import get_real_data
+        except ModuleNotFoundError:
+            from .real_data import get_real_data
         data = get_real_data(credentials)
         mode = "real"
     else:
+        try:
+            from mock_data import get_mock_data
+        except ModuleNotFoundError:
+            from .mock_data import get_mock_data
         data = get_mock_data()
         mode = "mock"
 

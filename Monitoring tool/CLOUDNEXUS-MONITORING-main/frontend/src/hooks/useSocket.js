@@ -34,6 +34,7 @@ export function useSocket(handlers) {
     socket.on('alerts:updated', data => handlersRef.current.onAlertsUpdated?.(data));
     socket.on('topology:updated', data => handlersRef.current.onTopologyUpdated?.(data));
     socket.on('session:revoked', data => handlersRef.current.onSessionRevoked?.(data));
+    socket.on('account:switched', data => handlersRef.current.onAccountSwitched?.(data));
 
     return () => {
       const u = localStorage.getItem('cn_tool_uid') || '';

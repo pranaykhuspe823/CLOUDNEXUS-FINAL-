@@ -7,7 +7,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 DB_PATH  = Path(os.environ.get('DB_PATH', Path(__file__).parent / 'cloudnexus.db'))
-_SESSION_KEY = hashlib.sha256(b"cloudnexus-session-key-2024").digest()
+_enc_key_env = os.environ.get('ENCRYPTION_KEY', '')
+_SESSION_KEY = bytes.fromhex(_enc_key_env) if len(_enc_key_env) == 64 else hashlib.sha256(b"cloudnexus-session-key-2024").digest()
 
 
 def _conn():
@@ -218,6 +219,35 @@ def get_cloud_account(account_id: int) -> dict | None:
     return account
 
 
+def _get_primary_account_id(email: str, provider: str):
+    with _conn() as db:
+        try:
+            row = db.execute(
+                "SELECT account_id FROM user_primary_accounts WHERE LOWER(user_email)=? AND provider=?",
+                (email, provider)
+            ).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+
+def _one_per_provider(accounts: list[dict], user_email: str) -> list[dict]:
+    """Return at most one account per provider, preferring the primary selection."""
+    email = (user_email or "").lower().strip()
+    by_provider: dict = {}
+    for acc in accounts:
+        p = acc.get("provider")
+        if p and p not in by_provider:
+            by_provider[p] = acc
+    for provider in list(by_provider.keys()):
+        primary_id = _get_primary_account_id(email, provider)
+        if primary_id:
+            primary = next((a for a in accounts if a["id"] == primary_id), None)
+            if primary:
+                by_provider[provider] = primary
+    return list(by_provider.values())
+
+
 def list_accounts_for_user(user_email: str) -> list[dict]:
     email = (user_email or "").lower().strip()
     with _conn() as db:
@@ -227,7 +257,8 @@ def list_accounts_for_user(user_email: str) -> list[dict]:
             WHERE LOWER(a.user_email)=? AND ca.status='active'
             ORDER BY ca.created_at ASC
         """, (email,)).fetchall()
-    return [_account_row(r) for r in rows]
+    all_accounts = [_account_row(r) for r in rows]
+    return _one_per_provider(all_accounts, email)
 
 
 def list_accounts_for_org(org_admin: str) -> list[dict]:
@@ -237,7 +268,8 @@ def list_accounts_for_org(org_admin: str) -> list[dict]:
             "SELECT * FROM cloud_accounts WHERE org_admin=? AND status='active' ORDER BY created_at ASC",
             (org,)
         ).fetchall()
-    return [_account_row(r) for r in rows]
+    all_accounts = [_account_row(r) for r in rows]
+    return _one_per_provider(all_accounts, org)
 
 
 def is_user_assigned_to_account(user_email: str, account_id: int) -> bool:

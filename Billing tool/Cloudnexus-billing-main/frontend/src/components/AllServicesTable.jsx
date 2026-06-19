@@ -117,11 +117,11 @@ function ResourceRow({ resource, isLive }) {
   );
 }
 
-export default function AllServicesTable({ mode = 'mock' }) {
+export default function AllServicesTable({ mode = 'mock', defaultProvider = 'all' }) {
   const [data,      setData]      = useState(null);
   const [loading,   setLoading]   = useState(true);
   const [error,     setError]     = useState(null);
-  const [filter,    setFilter]    = useState('all');   // provider filter
+  const [filter,    setFilter]    = useState(defaultProvider);
   const [typeFilter, setTypeFilter] = useState('all'); // resource type filter
   const [search,    setSearch]    = useState('');
 

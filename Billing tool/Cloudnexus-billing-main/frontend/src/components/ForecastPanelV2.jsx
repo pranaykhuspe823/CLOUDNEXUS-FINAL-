@@ -37,13 +37,17 @@ export default function ForecastPanelV2({ forecast, loading }) {
   }
 
   // ── Real data from API ──────────────────────────────────────────────
-  const shares   = forecast.provider_shares   || { aws: 0.443, gcp: 0.328, azure: 0.229 };
+  // provider_shares comes from the backend based on actual spend — never use hardcoded fallbacks
+  const shares   = forecast.provider_shares   || {};
   const provHist = forecast.provider_history  || {};  // { aws: [...], gcp: [...], azure: [...] }
   const forecastArr = forecast.forecast_30d   || [];
   const lowerArr    = forecast.lower_band     || [];
   const upperArr    = forecast.upper_band     || [];
   const riskLevel   = forecast.risk_level     || 'medium';
   const seasonPeriod = forecast.seasonal_period;
+
+  // Always show all three providers — unconnected ones use estimated share from MTD
+  const activeProviderKeys = ['aws', 'gcp', 'azure'];
 
   const histLen  = 30;
   const fcastLen = forecastArr.length || 30;
@@ -56,7 +60,7 @@ export default function ForecastPanelV2({ forecast, loading }) {
   const allLabels   = [...histLabels, ...fcastLabels];
 
   function buildDatasets() {
-    const providers = selectedProvider === 'all' ? ['aws', 'gcp', 'azure'] : [selectedProvider];
+    const providers = selectedProvider === 'all' ? activeProviderKeys : [selectedProvider];
 
     return providers.flatMap((p) => {
       const color = PROVIDER_COLORS[p];
@@ -95,15 +99,13 @@ export default function ForecastPanelV2({ forecast, loading }) {
     });
   }
 
-  // Only show providers that have actual data (share > 0) — hides $0 rows for unconnected providers
-  const forecastProviders = ['aws', 'gcp', 'azure']
-    .map(k => ({
-      key:      k,
-      share:    shares[k] || 0,
-      forecast: Math.round(forecast.total_30d * (shares[k] || 0)),
-      trendPct: forecast.trend_pct || 0,
-    }))
-    .filter(p => p.share > 0 || forecast.total_30d === 0);
+  // Only show providers with real spend data — no zeros for unconnected providers
+  const forecastProviders = activeProviderKeys.map(k => ({
+    key:      k,
+    share:    shares[k] || 0,
+    forecast: Math.round(forecast.total_30d * (shares[k] || 0)),
+    trendPct: forecast.trend_pct || 0,
+  }));
 
   const selColor = PROVIDER_COLORS[selectedProvider] || '#888';
 
@@ -122,7 +124,7 @@ export default function ForecastPanelV2({ forecast, loading }) {
           style={selectedProvider === 'all' ? { borderColor: '#888', color: '#555', background: '#f5f5f5' } : {}}
           onClick={() => setSelectedProvider('all')}
         >All Providers</button>
-        {['aws', 'gcp', 'azure'].filter(p => (shares[p] || 0) > 0).map(p => (
+        {activeProviderKeys.map(p => (
           <button key={p}
             className={`fcast-prov-btn ${selectedProvider === p ? 'active' : ''}`}
             style={selectedProvider === p ? { borderColor: PROVIDER_COLORS[p], color: PROVIDER_COLORS[p], background: `${PROVIDER_COLORS[p]}12` } : {}}
@@ -160,7 +162,7 @@ export default function ForecastPanelV2({ forecast, loading }) {
       {/* Legend */}
       <div className="chart-legend" style={{ marginTop: 10 }}>
         {selectedProvider === 'all' ? (
-          ['aws', 'gcp', 'azure'].map(p => (
+          activeProviderKeys.map(p => (
             <span key={p}><span className="leg-dot" style={{ background: PROVIDER_COLORS[p] }} />{PROVIDER_META[p].label}</span>
           ))
         ) : (

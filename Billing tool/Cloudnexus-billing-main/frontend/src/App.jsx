@@ -448,22 +448,29 @@ export default function App() {
     { label: 'Cost Savings Found', value: fmt.usd(overview.savings_found),    sub: 'by AI optimizer',                                                                                          color:'var(--color-success)' },
   ] : [];
 
-  const gcpIsEstimated  = providers.gcp?._is_estimated;
   const gcpNotConnected = providers.gcp?._not_connected;
+  const gcpCostMethod   = providers.gcp?._gcp_cost_method;
+  const gcpCostSub      = gcpNotConnected
+    ? 'not connected'
+    : gcpCostMethod === 'live_billing_api'
+      ? 'live billing data'
+      : gcpCostMethod === 'estimated_from_resources'
+        ? 'estimated from resources'
+        : (providers.gcp ? fmt.pct(providers.gcp.delta_pct) : '');
   const gcpMetrics = providers.gcp ? [
     { label: 'GCP MTD',
       value: gcpNotConnected ? '—' : fmt.usd(providers.gcp.mtd),
-      sub:   gcpNotConnected ? 'not connected' : gcpIsEstimated ? 'estimated (BigQuery required)' : fmt.pct(providers.gcp.delta_pct),
+      sub:   gcpCostSub,
       color: 'var(--color-success)' },
     { label: 'GCE Instances',
       value: gcpNotConnected ? '—' : fmt.num(providers.gcp.metrics?.instances),
-      sub:   gcpNotConnected ? 'not connected' : gcpIsEstimated ? 'estimated' : 'running' },
+      sub:   gcpNotConnected ? 'not connected' : 'running' },
     { label: 'BigQuery Scanned',
-      value: gcpNotConnected ? '—' : `${providers.gcp.metrics?.bigquery_tb} TB`,
-      sub:   gcpNotConnected ? 'not connected' : gcpIsEstimated ? 'estimated' : `${fmt.usd(providers.gcp.metrics?.bigquery_cost)}/mo` },
+      value: gcpNotConnected ? '—' : `${providers.gcp.metrics?.bigquery_tb ?? 0} TB`,
+      sub:   gcpNotConnected ? 'not connected' : `${fmt.usd(providers.gcp.metrics?.bigquery_cost ?? 0)}/mo` },
     { label: 'GKE Pods',
       value: gcpNotConnected ? '—' : fmt.num(providers.gcp.metrics?.gke_pods),
-      sub:   gcpNotConnected ? 'not connected' : gcpIsEstimated ? 'estimated' : 'running' },
+      sub:   gcpNotConnected ? 'not connected' : 'running' },
   ] : [];
 
   const azureNotConnected = providers.azure?._not_connected;
@@ -489,7 +496,7 @@ export default function App() {
       sub: `Trend: ${forecast.trend_pct > 0 ? '+' : ''}${forecast.trend_pct}%/mo`,
       color: 'var(--color-warning)' },
     { label: 'Model Confidence',      value: `${forecast.confidence}%`,
-      sub: `${forecast.models_used?.length || 4} models blended` },
+      sub: `${forecast.models_used?.length || 5} models blended` },
     { label: 'Key Driver',            value: forecast.key_drivers?.[0]?.name || '—',
       sub: forecast.key_drivers?.[0]?.impact || '' },
     { label: 'Risk Level',            value: (forecast.risk_level || 'medium').toUpperCase(),
@@ -529,6 +536,19 @@ export default function App() {
           Unconnected providers show mock data.{' '}
           <span style={{ cursor:'pointer', textDecoration:'underline' }} onClick={() => setModalOpen(true)}>
             Manage connections
+          </span>
+        </div>
+      )}
+      {mode === 'real' && connectedProviders.length > 0 && providers.aws?._warming && (
+        <div style={{
+          background: '#fff8e1', borderBottom: '1px solid #ffc107',
+          padding: '6px 18px', fontSize: 12, color: '#5f4200',
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          <span style={{ animation: 'spin 1s linear infinite', display:'inline-block' }}>⟳</span>
+          Fetching live cloud data in the background — showing estimated data until ready.{' '}
+          <span style={{ cursor:'pointer', textDecoration:'underline', fontWeight:600 }} onClick={refresh}>
+            Refresh now
           </span>
         </div>
       )}
@@ -686,15 +706,19 @@ export default function App() {
       {/* ── GCP ── */}
       {tab === 'gcp' && (
         <>
-          {mode === 'real' && connections.gcp?.connected && providers.gcp?._is_estimated && (
-            <div style={{ background:'#eff6ff', border:'1px solid #93c5fd', borderRadius:8, padding:'10px 16px', marginBottom:14, fontSize:12, color:'#1e40af', display:'flex', alignItems:'center', gap:8 }}>
-              GCP is connected but cost data requires <strong>BigQuery billing export</strong>.
-              Showing <strong>estimated figures</strong> — enable BigQuery export in your GCP project for live cost data.
+          {mode === 'real' && connections.gcp?.connected && gcpCostMethod === 'estimated_from_resources' && (
+            <div style={{ background:'#f0fdf4', border:'1px solid #86efac', borderRadius:8, padding:'10px 16px', marginBottom:14, fontSize:12, color:'#14532d', display:'flex', alignItems:'center', gap:8 }}>
+              <strong>Live GCP data</strong> — resource inventory fetched from Google Cloud APIs. Costs calculated from GCP pricing catalog.
             </div>
           )}
-          {mode === 'real' && connections.gcp?.connected && !providers.gcp?._is_estimated && (
+          {mode === 'real' && connections.gcp?.connected && gcpCostMethod === 'live_billing_api' && (
             <div style={{ background:'#f0fdf4', border:'1px solid #86efac', borderRadius:8, padding:'10px 16px', marginBottom:14, fontSize:12, color:'#14532d', display:'flex', alignItems:'center', gap:8 }}>
-              <strong>Live GCP data</strong> — costs and instances fetched from Google Cloud APIs.
+              ✓ <strong>Live GCP billing data</strong> — exact costs fetched directly from Cloud Billing API.
+            </div>
+          )}
+          {mode === 'real' && connections.gcp?.connected && gcpCostMethod === 'estimated_from_resources' && (
+            <div style={{ background:'#fffbeb', border:'1px solid #fcd34d', borderRadius:8, padding:'10px 16px', marginBottom:14, fontSize:12, color:'#78350f', display:'flex', alignItems:'center', gap:8 }}>
+              <strong>Cost estimated from resource inventory.</strong> For exact billing data, grant <code>roles/billing.viewer</code> on the billing account to your GCP service account.
             </div>
           )}
           {mode === 'real' && !connections.gcp?.connected && (
@@ -718,7 +742,13 @@ export default function App() {
           ) : (
             <>
               <div className="section-card">
-                <div className="section-title">GCP — 14-day spend{gcpIsEstimated && <span style={{marginLeft:6,fontSize:10,color:'#94a3b8'}}>(estimated)</span>}</div>
+                <div className="section-title">GCP — 14-day spend
+                  {gcpCostMethod === 'live_billing_api'
+                    ? <span style={{marginLeft:6,fontSize:10,color:'#22c55e',fontWeight:700}}>LIVE</span>
+                    : gcpCostMethod === 'estimated_from_resources'
+                      ? <span style={{marginLeft:6,fontSize:10,color:'#94a3b8'}}>(est. from resources)</span>
+                      : null}
+                </div>
                 <ProviderBarChart data={providers.gcp?.daily} color="#4285F4" label="GCP Daily Cost" />
               </div>
               <div className="section-card">
@@ -727,7 +757,7 @@ export default function App() {
               </div>
               <div className="section-card">
                 <div className="section-title" style={{ display:'flex', alignItems:'center', gap:6 }}><ProviderLogo provider="gcp" size={14} /> All GCP Resources — Compute · BigQuery · GKE</div>
-                <AllServicesTable mode={mode} />
+                <AllServicesTable mode={mode} defaultProvider="GCP" />
               </div>
             </>
           )}
@@ -772,7 +802,7 @@ export default function App() {
               </div>
               <div className="section-card">
                 <div className="section-title" style={{ display:'flex', alignItems:'center', gap:6 }}><ProviderLogo provider="azure" size={14} /> All Azure Resources — VMs · Storage · AKS · App Services</div>
-                <AllServicesTable mode={mode} />
+                <AllServicesTable mode={mode} defaultProvider="AZURE" />
               </div>
             </>
           )}
@@ -788,7 +818,7 @@ export default function App() {
             <div style={{ fontSize: 12, color: 'var(--text3)', marginTop: 4, marginBottom: 16 }}>
               Side-by-side provider breakdown, budget tracking, savings recommendations, performance radar, and full cross-service cost table.
             </div>
-            <CostComparisonPanel mode={mode} />
+            <CostComparisonPanel mode={mode} providers={providers} overview={overview} trend={trend} />
           </div>
 
           {/* Cross-Cloud FinOps Analysis Section */}
@@ -798,7 +828,7 @@ export default function App() {
               Shows connected cloud services (best-effort), per-day and per-month cost estimates, plus actionable tips.
             </div>
             <div style={{ marginTop: 12 }}>
-              <CrossCloudAnalysis />
+              <CrossCloudAnalysis mode={mode} providers={providers} />
             </div>
           </div>
         </div>
@@ -819,7 +849,7 @@ export default function App() {
       {tab === 'invoices' && (
         <div className="section-card">
           <div className="section-title">Cloud Provider Invoices</div>
-          <InvoicePanel mode={mode} />
+          <InvoicePanel mode={mode} uid={uidRef.current} />
         </div>
       )}
 

@@ -148,7 +148,7 @@ function ServiceRow({ s, provider, onClick }) {
         <div className="svc-name-cell">
           <ServiceLogo type={s.type} family={s.family} size={32} />
           <div>
-            <div className="svc-name" title={s.name}>{s.name.length > 28 ? s.name.substring(0, 28) + '…' : s.name}</div>
+            <div className="svc-name" title={s.name ?? ''}>{(s.name?.length ?? 0) > 28 ? s.name.substring(0, 28) + '…' : (s.name || '—')}</div>
             <div className="svc-type">{s.family}</div>
           </div>
         </div>
@@ -226,8 +226,8 @@ export default function ServiceDetailTable({ services, provider, onRowClick, sho
   const [familyFilter, setFamilyFilter] = useState('all');
   const [statusFilter, setStatusFilter] = useState('all');
 
-  const regions = useMemo(() => ['all', ...new Set(services.map(s => s.region))], [services]);
-  const families = useMemo(() => ['all', ...new Set(services.map(s => s.family))], [services]);
+  const regions = useMemo(() => ['all', ...new Set(services.map(s => s.region).filter(Boolean))], [services]);
+  const families = useMemo(() => ['all', ...new Set(services.map(s => s.family).filter(Boolean))], [services]);
 
   function handleSort(key) {
     if (sortKey === key) setSortDir(d => d === 'asc' ? 'desc' : 'asc');

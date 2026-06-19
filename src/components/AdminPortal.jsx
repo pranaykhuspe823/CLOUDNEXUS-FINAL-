@@ -46,6 +46,9 @@ const CopyIcon = () => (
 const TrashIcon = () => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
 );
+const DownloadIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+);
 const EyeIcon = () => (
   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
 );
@@ -686,13 +689,18 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   const [cloudAccounts, setCloudAccounts]               = useState([]);
   const [cloudAccountsLoading, setCloudAccountsLoading] = useState(false);
   const [orgUserCloudAccess, setOrgUserCloudAccess]     = useState({}); // email → [{id, provider, label}]
-  const [cloudAccountModal, setCloudAccountModal]       = useState(null); // {userEmail, userName, provider, accounts}
+  const [cloudAccountModal, setCloudAccountModal]       = useState(null); // {userEmail, userName, provider, accounts, primaryId}
   const [switchingAccount, setSwitchingAccount]         = useState(null); // {accountId, done}
   const [addCloudAccountModal, setAddCloudAccountModal] = useState(false);
   const [assignCloudAccountModal, setAssignCloudAccountModal] = useState(null); // account object
-  const [cloudAccountForm, setCloudAccountForm] = useState({ provider: 'aws', label: '', creds: {} });
+  const [cloudAccountForm, setCloudAccountForm] = useState({ provider: 'aws', label: '', creds: { region: 'us-east-1' } });
   const [cloudAccountSaving, setCloudAccountSaving] = useState(false);
   const [cloudAccountErr, setCloudAccountErr]       = useState('');
+  const [cloudAccountsAuthErr, setCloudAccountsAuthErr] = useState('');
+  const [editCloudAccountModal, setEditCloudAccountModal] = useState(null); // account object
+  const [editCloudAccountCreds, setEditCloudAccountCreds] = useState({});
+  const [editCloudAccountSaving, setEditCloudAccountSaving] = useState(false);
+  const [editCloudAccountErr, setEditCloudAccountErr]       = useState('');
   const [assignSelection, setAssignSelection]       = useState({}); // email → bool
   const [assignSaving, setAssignSaving]             = useState(false);
   const [credViewModal, setCredViewModal]           = useState(null); // {id, label, provider}
@@ -703,10 +711,11 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   function loadCloudAccounts(scope) {
     if (!scope) return;
     setCloudAccountsLoading(true);
+    setCloudAccountsAuthErr('');
     apiFetch(`/api/admin/cloud-accounts?uid=${encodeURIComponent(scope)}`)
-      .then(r => r.json())
+      .then(r => { if (r.status === 401) throw new Error('session_expired'); return r.json(); })
       .then(d => { setCloudAccounts(Array.isArray(d.accounts) ? d.accounts : []); setCloudAccountsLoading(false); })
-      .catch(() => setCloudAccountsLoading(false));
+      .catch(err => { if (err?.message === 'session_expired') setCloudAccountsAuthErr('Session expired — please log out and log back in to manage cloud accounts.'); setCloudAccountsLoading(false); });
   }
 
   function loadOrgUserCloudAccess(scope) {
@@ -717,18 +726,18 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
       .catch(() => {});
   }
 
-  function handleSwitchAccount(account) {
+  async function handleSwitchAccount(account) {
     setSwitchingAccount({ accountId: account.id, done: false });
-    socketRef.current?.emit('admin:switch-account', {
-      targetEmail: cloudAccountModal.userEmail,
-      provider: account.provider,
-      accountId: account.id,
-      label: account.label,
-    });
-    setTimeout(() => {
-      setSwitchingAccount({ accountId: account.id, done: true });
-      setTimeout(() => setSwitchingAccount(null), 1800);
-    }, 500);
+    try {
+      await apiFetch(`/api/admin/cloud-accounts/${account.id}/set-primary?uid=${encodeURIComponent(orgScope)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uid: orgScope, userEmail: cloudAccountModal.userEmail }),
+      });
+    } catch {}
+    setSwitchingAccount({ accountId: account.id, done: true });
+    setCloudAccountModal(prev => prev ? { ...prev, primaryId: account.id } : prev);
+    setTimeout(() => setSwitchingAccount(null), 1800);
   }
 
   async function openCredViewFromUserModal(account) {
@@ -1310,6 +1319,27 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
     });
   }
 
+  function openDownloadModal(u) {
+    const existing = userActivity[u.email];
+    if (existing && !existing.loading) {
+      setExportModal({ target: u, events: existing.events, dateFrom: '', dateTo: '' });
+    } else {
+      // Fetch activity first, then open modal
+      setUserActivity(prev => ({ ...prev, [u.email]: { loading: true, events: [] } }));
+      fetch(`/api/activity/${encodeURIComponent(u.email)}`)
+        .then(r => r.json())
+        .then(data => {
+          const events = data.events || [];
+          setUserActivity(p => ({ ...p, [u.email]: { loading: false, events } }));
+          setExportModal({ target: u, events, dateFrom: '', dateTo: '' });
+        })
+        .catch(() => {
+          setUserActivity(p => ({ ...p, [u.email]: { loading: false, events: [] } }));
+          setExportModal({ target: u, events: [], dateFrom: '', dateTo: '' });
+        });
+    }
+  }
+
   // Manage Plan — plan cards visibility + bundle toggle (must be at component level)
   const [showPlans,     setShowPlans]     = useState(() => !!getGlobalSettings().currentPlan);
   const [bundleTab,     setBundleTab]     = useState(() => {
@@ -1879,7 +1909,6 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
           ) : (
             <table className="ap-table">
               <thead><tr>
-                <th style={{width:32}}></th>
                 <th>User</th><th>Status</th><th>Last Login</th><th>Session</th><th>Access</th><th>Actions</th>
               </tr></thead>
               <tbody>
@@ -1897,13 +1926,6 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                   return (
                     <Fragment key={u.id}>
                     <tr style={{background: isExpanded ? "#f8faff" : undefined}}>
-                      {/* Expand toggle */}
-                      <td style={{padding:"14px 8px 14px 16px"}}>
-                        <button onClick={() => toggleActivityRow(u.email)} style={{background:"none",border:"none",cursor:"pointer",padding:4,borderRadius:4,color:"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",transition:"transform 0.2s",transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)"}}>
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-                        </button>
-                      </td>
-
                       {/* User */}
                       <td>
                         <div className="ap-user-cell">
@@ -1976,12 +1998,14 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                               <button
                                 key={p}
                                 title={`View ${p.toUpperCase()} accounts for ${u.name}`}
-                                onClick={() => setCloudAccountModal({
-                                  userEmail: u.email,
-                                  userName: u.name,
-                                  provider: p,
-                                  accounts: userAccounts.filter(a => a.provider === p),
-                                })}
+                                onClick={() => {
+                                  const provAccounts = userAccounts.filter(a => a.provider === p);
+                                  setCloudAccountModal({ userEmail: u.email, userName: u.name, provider: p, accounts: provAccounts, primaryId: null });
+                                  apiFetch(`/api/admin/cloud-accounts/primary?uid=${encodeURIComponent(orgScope)}&userEmail=${encodeURIComponent(u.email)}&provider=${p}`)
+                                    .then(r => r.json())
+                                    .then(d => { if (d.accountId) setCloudAccountModal(prev => prev ? { ...prev, primaryId: d.accountId } : prev); })
+                                    .catch(() => {});
+                                }}
                                 style={{background:"none",border:"1px solid #e2e8f0",borderRadius:6,padding:"2px 5px",cursor:"pointer",display:"inline-flex",alignItems:"center",gap:3,fontSize:11,color:"#475569"}}
                               >
                                 <ProviderLogo provider={p} size={14} />
@@ -2018,6 +2042,26 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                               </button>
                             );
                           })()}
+                          <button
+                            className="ap-btn-icon"
+                            onClick={() => openDownloadModal(u)}
+                            title="Download activity log"
+                            style={{background:"none",border:"1px solid #e2e8f0",borderRadius:6,padding:"5px 7px",cursor:"pointer",color:"#38bdf8",display:"flex",alignItems:"center",justifyContent:"center",transition:"background 0.15s"}}
+                            onMouseEnter={e=>e.currentTarget.style.background="#f0f9ff"}
+                            onMouseLeave={e=>e.currentTarget.style.background="none"}
+                          >
+                            <DownloadIcon />
+                          </button>
+                          <button
+                            className="ap-btn-icon"
+                            onClick={() => toggleActivityRow(u.email)}
+                            title={isExpanded ? "Close activity log" : "View activity log"}
+                            style={{background: isExpanded ? "#eff6ff" : "none",border:`1px solid ${isExpanded ? "#93c5fd" : "#e2e8f0"}`,borderRadius:6,padding:"5px 7px",cursor:"pointer",color: isExpanded ? "#2563eb" : "#64748b",display:"flex",alignItems:"center",justifyContent:"center",transition:"background 0.15s"}}
+                            onMouseEnter={e=>{if(!isExpanded){e.currentTarget.style.background="#f8fafc";e.currentTarget.style.borderColor="#94a3b8";}}}
+                            onMouseLeave={e=>{if(!isExpanded){e.currentTarget.style.background="none";e.currentTarget.style.borderColor="#e2e8f0";}}}
+                          >
+                            <EyeIcon />
+                          </button>
                           <button className="ap-btn-danger" onClick={() => deleteUser(u.id)} title="Delete user">
                             <TrashIcon />
                           </button>
@@ -2031,7 +2075,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                     {/* ── Activity log expansion ── */}
                     {isExpanded && (
                       <tr key={`${u.id}-activity`} style={{background:"#0f172a"}}>
-                        <td colSpan={7} style={{padding:"0", borderBottom:"2px solid #1e293b"}}>
+                        <td colSpan={6} style={{padding:"0", borderBottom:"2px solid #1e293b"}}>
                           <div style={{fontFamily:"'Courier New',Courier,monospace"}}>
                             {/* Log header bar */}
                             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"10px 20px 10px 52px",background:"#1e293b",borderBottom:"1px solid #334155"}}>
@@ -2042,17 +2086,6 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                               <div style={{display:"flex",gap:10,alignItems:"center"}}>
                                 {actData && !actData.loading && (
                                   <span style={{fontSize:11,color:"#475569"}}>{actData.events.length} events</span>
-                                )}
-                                {actData && !actData.loading && actData.events.length > 0 && (
-                                  <div style={{position:"relative"}}>
-                                    <button
-                                      onClick={() => setExportModal({ target: u, events: actData.events, dateFrom: '', dateTo: '' })}
-                                      style={{fontSize:11,color:"#38bdf8",background:"none",border:"1px solid #1e40af",cursor:"pointer",padding:"2px 10px",borderRadius:4,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5}}
-                                    >
-                                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                                      Download
-                                    </button>
-                                  </div>
                                 )}
                                 <button
                                   onClick={() => { setUserActivity(p => { const n={...p}; delete n[u.email]; return n; }); setTimeout(() => toggleActivityRow(u.email), 10); }}
@@ -2103,11 +2136,41 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
   }
 
   function renderCloudAccounts() {
+    const AWS_REGIONS = [
+      { value: 'us-east-1',      label: 'US East (N. Virginia)       — us-east-1' },
+      { value: 'us-east-2',      label: 'US East (Ohio)              — us-east-2' },
+      { value: 'us-west-1',      label: 'US West (N. California)     — us-west-1' },
+      { value: 'us-west-2',      label: 'US West (Oregon)            — us-west-2' },
+      { value: 'ca-central-1',   label: 'Canada (Central)            — ca-central-1' },
+      { value: 'eu-west-1',      label: 'Europe (Ireland)            — eu-west-1' },
+      { value: 'eu-west-2',      label: 'Europe (London)             — eu-west-2' },
+      { value: 'eu-west-3',      label: 'Europe (Paris)              — eu-west-3' },
+      { value: 'eu-central-1',   label: 'Europe (Frankfurt)          — eu-central-1' },
+      { value: 'eu-central-2',   label: 'Europe (Zurich)             — eu-central-2' },
+      { value: 'eu-north-1',     label: 'Europe (Stockholm)          — eu-north-1' },
+      { value: 'eu-south-1',     label: 'Europe (Milan)              — eu-south-1' },
+      { value: 'ap-south-1',     label: 'Asia Pacific (Mumbai)       — ap-south-1' },
+      { value: 'ap-south-2',     label: 'Asia Pacific (Hyderabad)    — ap-south-2' },
+      { value: 'ap-southeast-1', label: 'Asia Pacific (Singapore)    — ap-southeast-1' },
+      { value: 'ap-southeast-2', label: 'Asia Pacific (Sydney)       — ap-southeast-2' },
+      { value: 'ap-southeast-3', label: 'Asia Pacific (Jakarta)      — ap-southeast-3' },
+      { value: 'ap-southeast-4', label: 'Asia Pacific (Melbourne)    — ap-southeast-4' },
+      { value: 'ap-northeast-1', label: 'Asia Pacific (Tokyo)        — ap-northeast-1' },
+      { value: 'ap-northeast-2', label: 'Asia Pacific (Seoul)        — ap-northeast-2' },
+      { value: 'ap-northeast-3', label: 'Asia Pacific (Osaka)        — ap-northeast-3' },
+      { value: 'ap-east-1',      label: 'Asia Pacific (Hong Kong)    — ap-east-1' },
+      { value: 'me-south-1',     label: 'Middle East (Bahrain)       — me-south-1' },
+      { value: 'me-central-1',   label: 'Middle East (UAE)           — me-central-1' },
+      { value: 'af-south-1',     label: 'Africa (Cape Town)          — af-south-1' },
+      { value: 'il-central-1',   label: 'Israel (Tel Aviv)           — il-central-1' },
+      { value: 'sa-east-1',      label: 'South America (São Paulo)   — sa-east-1' },
+    ];
+
     const PROVIDER_FIELDS = {
       aws:   [
         { key: 'accessKeyId',     label: 'Access Key ID',     type: 'text',     required: true },
         { key: 'secretAccessKey', label: 'Secret Access Key', type: 'password', required: true },
-        { key: 'region',          label: 'Default Region',    type: 'text',     placeholder: 'us-east-1' },
+        { key: 'region',          label: 'Default Region',    type: 'select',   options: AWS_REGIONS, defaultValue: 'us-east-1' },
       ],
       gcp:   [
         { key: 'projectId',         label: 'Project ID',           type: 'text',     required: true },
@@ -2140,15 +2203,15 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
         catch { setCloudAccountErr('Service account JSON is not valid JSON'); setCloudAccountSaving(false); return; }
       }
       try {
-        const r = await apiFetch('/api/admin/cloud-accounts', {
+        const r = await apiFetch(`/api/admin/cloud-accounts?uid=${encodeURIComponent(orgScope)}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ uid: orgScope, provider, label, credentials }),
         });
         const d = await r.json();
-        if (!r.ok || !d.success) { setCloudAccountErr(d.error || d.message || 'Failed — check credentials'); setCloudAccountSaving(false); return; }
+        if (!r.ok || !d.success) { setCloudAccountErr(d.message || d.error || 'Failed — check credentials'); setCloudAccountSaving(false); return; }
         setAddCloudAccountModal(false);
-        setCloudAccountForm({ provider: 'aws', label: '', creds: {} });
+        setCloudAccountForm({ provider: 'aws', label: '', creds: { region: 'us-east-1' } });
         loadCloudAccounts(orgScope);
         loadOrgUserCloudAccess(orgScope);
       } catch { setCloudAccountErr('Network error'); }
@@ -2160,6 +2223,31 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
       await apiFetch(`/api/admin/cloud-accounts/${accountId}?uid=${encodeURIComponent(orgScope)}`, { method: 'DELETE' }).catch(() => {});
       loadCloudAccounts(orgScope);
       loadOrgUserCloudAccess(orgScope);
+    }
+
+    async function handleUpdateAccount(e) {
+      e.preventDefault();
+      if (!editCloudAccountModal) return;
+      setEditCloudAccountErr('');
+      setEditCloudAccountSaving(true);
+      let credentials = { ...editCloudAccountCreds };
+      if (editCloudAccountModal.provider === 'gcp' && typeof credentials.serviceAccountJson === 'string') {
+        try { credentials = { ...JSON.parse(credentials.serviceAccountJson), projectId: credentials.projectId }; }
+        catch { setEditCloudAccountErr('Service account JSON is not valid JSON'); setEditCloudAccountSaving(false); return; }
+      }
+      try {
+        const r = await apiFetch(`/api/admin/cloud-accounts/${editCloudAccountModal.id}?uid=${encodeURIComponent(orgScope)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uid: orgScope, credentials }),
+        });
+        const d = await r.json();
+        if (!r.ok || !d.success) { setEditCloudAccountErr(d.message || d.error || 'Failed — check credentials'); setEditCloudAccountSaving(false); return; }
+        setEditCloudAccountModal(null);
+        setEditCloudAccountCreds({});
+        loadCloudAccounts(orgScope);
+      } catch { setEditCloudAccountErr('Network error'); }
+      setEditCloudAccountSaving(false);
     }
 
     function openAssignModal(account) {
@@ -2224,12 +2312,17 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
         </div>
 
         <div className="ap-card">
+          {cloudAccountsAuthErr && (
+            <div style={{ margin: '12px 0', padding: '10px 14px', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 7, fontSize: 13, color: '#dc2626', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>⚠️</span> {cloudAccountsAuthErr}
+            </div>
+          )}
           {cloudAccountsLoading ? (
             <div className="ap-empty">
               <div style={{ width: 32, height: 32, border: '3px solid #e2e8f0', borderTopColor: '#2563eb', borderRadius: '50%', animation: 'spin 0.75s linear infinite', margin: '0 auto 12px' }} />
               <div className="ap-empty-text" style={{ color: '#64748b' }}>Loading accounts…</div>
             </div>
-          ) : cloudAccounts.length === 0 ? (
+          ) : cloudAccountsAuthErr ? null : cloudAccounts.length === 0 ? (
             <div className="ap-empty">
               <div className="ap-empty-icon">☁️</div>
               <div className="ap-empty-text">No cloud accounts yet. Add one to get started.</div>
@@ -2286,6 +2379,13 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                             Assign Users
                           </button>
                           <button
+                            onClick={() => { setEditCloudAccountModal(account); setEditCloudAccountCreds(account.provider === 'aws' ? { region: 'us-east-1' } : {}); setEditCloudAccountErr(''); }}
+                            style={{ fontSize: 11, fontWeight: 600, padding: '4px 10px', background: '#f0fdf4', color: '#15803d', border: '1px solid #bbf7d0', borderRadius: 6, cursor: 'pointer', fontFamily: 'inherit' }}
+                            title="Update credentials"
+                          >
+                            Update Keys
+                          </button>
+                          <button
                             onClick={() => handleDeleteAccount(account.id)}
                             className="ap-btn-danger"
                             title="Delete account"
@@ -2318,7 +2418,7 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                       {['aws', 'gcp', 'azure'].map(p => (
                         <button
                           key={p} type="button"
-                          onClick={() => setCloudAccountForm(f => ({ ...f, provider: p, creds: {} }))}
+                          onClick={() => setCloudAccountForm(f => ({ ...f, provider: p, creds: p === 'aws' ? { region: 'us-east-1' } : {} }))}
                           style={{ flex: 1, padding: '8px 0', border: `2px solid ${cloudAccountForm.provider === p ? '#2563eb' : '#e2e8f0'}`, borderRadius: 8, background: cloudAccountForm.provider === p ? '#eff6ff' : '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, fontWeight: 600, fontSize: 12, color: cloudAccountForm.provider === p ? '#2563eb' : '#374151' }}
                         >
                           <ProviderLogo provider={p} size={16} /> {p.toUpperCase()}
@@ -2350,6 +2450,18 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                           required={!!f.required}
                           style={{ width: '100%', padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: 7, fontSize: 12, fontFamily: 'monospace', resize: 'vertical', boxSizing: 'border-box' }}
                         />
+                      ) : f.type === 'select' ? (
+                        <select
+                          value={cloudAccountForm.creds[f.key] || f.defaultValue || ''}
+                          onChange={e => setCloudAccountForm(cf => ({ ...cf, creds: { ...cf.creds, [f.key]: e.target.value } }))}
+                          required={!!f.required}
+                          style={{ width: '100%', padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: 7, fontSize: 13, fontFamily: 'inherit', boxSizing: 'border-box', background: '#fff', cursor: 'pointer' }}
+                        >
+                          {!f.required && <option value="">— Select region —</option>}
+                          {(f.options || []).map(opt => (
+                            <option key={opt.value} value={opt.value}>{opt.label}</option>
+                          ))}
+                        </select>
                       ) : (
                         <input
                           type={f.type}
@@ -2376,6 +2488,58 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
             </div>
           </div>
         )}
+
+        {/* ── Update Credentials Modal ── */}
+        {editCloudAccountModal && (() => {
+          const editFields = PROVIDER_FIELDS[editCloudAccountModal.provider] || [];
+          return (
+            <div className="ap-modal-overlay" onClick={() => setEditCloudAccountModal(null)}>
+              <div className="ap-modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 520 }}>
+                <div className="ap-modal-header">
+                  <span>Update Credentials — {editCloudAccountModal.label}</span>
+                  <button className="ap-modal-close" onClick={() => setEditCloudAccountModal(null)}>×</button>
+                </div>
+                <form onSubmit={handleUpdateAccount}>
+                  <div className="ap-modal-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                    <div style={{ padding: '10px 12px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 7, fontSize: 12, color: '#92400e' }}>
+                      Enter new credentials below. They will be verified with {editCloudAccountModal.provider.toUpperCase()} before saving.
+                    </div>
+                    {editFields.map(f => (
+                      <div key={f.key}>
+                        <label style={{ fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 5 }}>
+                          {f.label} {f.required && <span style={{ color: '#dc2626' }}>*</span>}
+                        </label>
+                        {f.type === 'select' ? (
+                          <select
+                            value={editCloudAccountCreds[f.key] || f.defaultValue || ''}
+                            onChange={e => setEditCloudAccountCreds(c => ({ ...c, [f.key]: e.target.value }))}
+                            required={!!f.required}
+                            style={{ width: '100%', padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: 7, fontSize: 13, fontFamily: 'inherit', boxSizing: 'border-box', background: '#fff' }}
+                          >
+                            {(f.options || []).map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                          </select>
+                        ) : f.type === 'textarea' ? (
+                          <textarea rows={4} value={editCloudAccountCreds[f.key] || ''} onChange={e => setEditCloudAccountCreds(c => ({ ...c, [f.key]: e.target.value }))} placeholder={f.placeholder || ''} required={!!f.required} style={{ width: '100%', padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: 7, fontSize: 12, fontFamily: 'monospace', resize: 'vertical', boxSizing: 'border-box' }} />
+                        ) : (
+                          <input type={f.type} value={editCloudAccountCreds[f.key] || ''} onChange={e => setEditCloudAccountCreds(c => ({ ...c, [f.key]: e.target.value }))} placeholder={f.placeholder || ''} required={!!f.required} style={{ width: '100%', padding: '8px 10px', border: '1px solid #e2e8f0', borderRadius: 7, fontSize: 13, fontFamily: 'inherit', boxSizing: 'border-box' }} />
+                        )}
+                      </div>
+                    ))}
+                    {editCloudAccountErr && (
+                      <div style={{ fontSize: 12, color: '#dc2626', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, padding: '8px 12px' }}>{editCloudAccountErr}</div>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', padding: '16px 24px', borderTop: '1px solid #f1f5f9' }}>
+                    <button type="button" onClick={() => setEditCloudAccountModal(null)} style={{ padding: '8px 18px', border: '1px solid #e2e8f0', borderRadius: 7, background: '#fff', fontWeight: 600, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}>Cancel</button>
+                    <button type="submit" disabled={editCloudAccountSaving} style={{ padding: '8px 18px', background: editCloudAccountSaving ? '#93c5fd' : 'linear-gradient(135deg,#2563eb,#1d4ed8)', color: '#fff', border: 'none', borderRadius: 7, fontWeight: 600, fontSize: 13, cursor: editCloudAccountSaving ? 'not-allowed' : 'pointer', fontFamily: 'inherit' }}>
+                      {editCloudAccountSaving ? 'Verifying…' : 'Save Credentials'}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* ── Assign Users Modal ── */}
         {assignCloudAccountModal && (
@@ -3253,20 +3417,26 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                     {cloudAccountModal.accounts.map(a => {
                       const isSwitching = switchingAccount?.accountId === a.id && !switchingAccount?.done;
                       const isDone      = switchingAccount?.accountId === a.id && switchingAccount?.done;
+                      const isActive    = cloudAccountModal.primaryId
+                        ? cloudAccountModal.primaryId === a.id
+                        : cloudAccountModal.accounts[0]?.id === a.id;
                       return (
-                      <div key={a.id} style={{ padding: '12px 14px', border: `1.5px solid ${isDone ? '#22c55e' : '#e2e8f0'}`, borderRadius: 10, background: isDone ? '#f0fdf4' : '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, transition: 'border-color 0.2s, background 0.2s' }}>
+                      <div key={a.id} style={{ padding: '12px 14px', border: `1.5px solid ${isDone ? '#22c55e' : isActive ? '#22c55e' : '#e2e8f0'}`, borderRadius: 10, background: isDone ? '#f0fdf4' : isActive ? '#f0fdf4' : '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, transition: 'border-color 0.2s, background 0.2s' }}>
                         <div style={{ flex: 1, minWidth: 0 }}>
                           <div style={{ fontWeight: 700, color: '#0f172a', fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
                             <ProviderLogo provider={a.provider} size={14} />
                             {a.label}
+                            {isActive && !isDone && (
+                              <span style={{ fontSize: 10, fontWeight: 700, color: '#16a34a', background: '#dcfce7', borderRadius: 4, padding: '1px 6px', letterSpacing: 0.3 }}>ACTIVE</span>
+                            )}
                             {isDone && (
-                              <span style={{ fontSize: 10, fontWeight: 700, color: '#16a34a', background: '#dcfce7', borderRadius: 4, padding: '1px 6px', letterSpacing: 0.3 }}>SWITCHED</span>
+                              <span style={{ fontSize: 10, fontWeight: 700, color: '#16a34a', background: '#dcfce7', borderRadius: 4, padding: '1px 6px', letterSpacing: 0.3 }}>SWITCHED ✓</span>
                             )}
                           </div>
                           <div style={{ fontSize: 11, color: '#22c55e', fontWeight: 600, marginTop: 3 }}>● Connected</div>
                         </div>
                         <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
-                          {cloudAccountModal.accounts.length > 1 && (
+                          {cloudAccountModal.accounts.length > 1 && !isActive && (
                             <button
                               onClick={() => !switchingAccount && handleSwitchAccount(a)}
                               disabled={!!switchingAccount}
@@ -3280,10 +3450,8 @@ export default function AdminPortal({ admin, onLogout, onOpenTool, onPhotoChange
                             >
                               {isSwitching ? (
                                 <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" style={{animation:'spin 0.7s linear infinite'}} strokeLinecap="round"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></svg> Switching…</>
-                              ) : isDone ? (
-                                <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg> Switched!</>
                               ) : (
-                                <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg> Switch</>
+                                <><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg> Set Active</>
                               )}
                             </button>
                           )}

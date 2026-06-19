@@ -8,7 +8,9 @@ const UNKNOWN_COLOR = '#3b82f6';
 
 function fmtGB(val, unit = 'GB') {
   if (val == null) return '—';
-  return val < 1 ? `${Math.round(val * 1024)} MB` : `${val.toFixed(2)} ${unit}`;
+  const n = Number(val);
+  if (isNaN(n)) return '—';
+  return n < 1 ? `${Math.round(n * 1024)} MB` : `${n.toFixed(2)} ${unit}`;
 }
 
 function CustomTooltip({ active, payload }) {
@@ -26,11 +28,14 @@ function CustomTooltip({ active, payload }) {
 }
 
 export function PieChart3D({ total, used, available, label, noUsageData = false, unit = 'GB' }) {
-  const usedPct  = total > 0 ? (used      / total) * 100 : 0;
-  const freePct  = total > 0 ? (available / total) * 100 : 0;
-  const totalStr = fmtGB(total, unit);
-  const usedStr  = fmtGB(used,  unit);
-  const availStr = fmtGB(available, unit);
+  const t = Number(total) || 0;
+  const u = Number(used) || 0;
+  const a = Number(available) || 0;
+  const usedPct  = t > 0 ? (u / t) * 100 : 0;
+  const freePct  = t > 0 ? (a / t) * 100 : 0;
+  const totalStr = fmtGB(t, unit);
+  const usedStr  = fmtGB(u, unit);
+  const availStr = fmtGB(a, unit);
 
   if (noUsageData) {
     const data = [{ name: 'EBS Provisioned', value: 100, color: UNKNOWN_COLOR, rawValue: total }];
