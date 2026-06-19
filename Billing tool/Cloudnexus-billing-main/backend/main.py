@@ -668,7 +668,8 @@ def _scheduler_loop():
                 continue
             _sent_today[email] = today_str  # mark before sending to avoid double-fire
             try:
-                data    = _get_data("real", email)
+                uid  = email.lower().strip()
+                data = _get_hot_cache_only(uid) or _get_cached_real_data(uid)
                 today   = now
                 ov      = data["overview"]
                 pr      = data["providers"]
@@ -727,7 +728,17 @@ def send_report_now(payload: ReportSendPayload):
     if "@" not in payload.email:
         raise HTTPException(status_code=400, detail="Invalid email address")
 
-    data    = _get_data("real", payload.email)
+    uid = payload.email.lower().strip()
+    # Try hot cache first (instant); fall back to blocking real fetch if cold
+    cached = _get_hot_cache_only(uid)
+    if cached is not None:
+        data = cached
+    else:
+        # Kick off background warm so subsequent calls are fast, then block for real data
+        import threading
+        threading.Thread(target=_get_cached_real_data, args=(uid,), daemon=True).start()
+        data = _get_cached_real_data(uid)   # blocking fetch — waits for real data
+
     today   = datetime.utcnow()
     ov      = data["overview"]
     pr      = data["providers"]

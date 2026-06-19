@@ -3865,7 +3865,35 @@ class ReportService {
       .filter(r => r.type === 'VPC' && r.internetGateway)
       .map(r => ({ ...r.internetGateway, vpcId: r.rawId, vpcName: r.name, region: r.region }));
 
-    const html = this._buildTemplate(alerts, all, { aws: awsRes, gcp: gcpRes, azure: azureRes }, { securityGroups, internetGateways, routeTables });
+    // ── Fetch billing cost data from billing backend ──────────────────────────
+    // This enriches the report with real spend data even when infra resources = 0
+    let billingOverview = null;
+    let billingProviders = { aws: null, gcp: null, azure: null };
+    try {
+      const billingBase = 'http://127.0.0.1:8001';
+      const uidParam    = encodeURIComponent(email);
+      const [ovRes, awsBill, gcpBill, azBill] = await Promise.allSettled([
+        fetch(`${billingBase}/api/overview?mode=real&uid=${uidParam}`,          { signal: AbortSignal.timeout(12000) }).then(r => r.ok ? r.json() : null),
+        fetch(`${billingBase}/api/provider/aws?mode=real&uid=${uidParam}`,      { signal: AbortSignal.timeout(12000) }).then(r => r.ok ? r.json() : null),
+        fetch(`${billingBase}/api/provider/gcp?mode=real&uid=${uidParam}`,      { signal: AbortSignal.timeout(12000) }).then(r => r.ok ? r.json() : null),
+        fetch(`${billingBase}/api/provider/azure?mode=real&uid=${uidParam}`,    { signal: AbortSignal.timeout(12000) }).then(r => r.ok ? r.json() : null),
+      ]);
+      billingOverview          = ovRes.status   === 'fulfilled' ? ovRes.value   : null;
+      billingProviders.aws     = awsBill.status === 'fulfilled' ? awsBill.value : null;
+      billingProviders.gcp     = gcpBill.status === 'fulfilled' ? gcpBill.value : null;
+      billingProviders.azure   = azBill.status  === 'fulfilled' ? azBill.value  : null;
+      logger.info(`[ReportService] billing data fetched — total_mtd=${billingOverview?.total_mtd ?? 'n/a'}`);
+    } catch (e) {
+      logger.warn(`[ReportService] billing data fetch failed: ${e.message}`);
+    }
+
+    const html = this._buildTemplate(
+      alerts, all,
+      { aws: awsRes, gcp: gcpRes, azure: azureRes },
+      { securityGroups, internetGateways, routeTables },
+      billingOverview,
+      billingProviders,
+    );
     const dateStr = new Date().toLocaleDateString('en-IN', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     });
@@ -3878,7 +3906,7 @@ class ReportService {
     });
   }
 
-  _buildTemplate(alerts, allResources, providers, { securityGroups = [], internetGateways = [], routeTables = [] } = {}) {
+  _buildTemplate(alerts, allResources, providers, { securityGroups = [], internetGateways = [], routeTables = [] } = {}, billingOverview = null, billingProviders = null) {
     const now      = new Date();
     const dateStr  = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
     const timeStr  = now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true });
@@ -4036,6 +4064,84 @@ class ReportService {
 
       <!-- DIVIDER -->
       <tr><td style="background:#ffffff;padding:0 44px;"><div style="height:1px;background:#f1f5f9;"></div></td></tr>
+
+      ${billingOverview ? (() => {
+        const fmtUsd = v => '$' + Number(v || 0).toLocaleString('en-US', { maximumFractionDigits: 0 });
+        const provColors = { aws: '#FF9900', gcp: '#4285F4', azure: '#008AD7' };
+        const provLabels = { aws: 'Amazon Web Services', gcp: 'Google Cloud Platform', azure: 'Microsoft Azure' };
+        const bpData = billingProviders || {};
+
+        const provRows = ['aws', 'gcp', 'azure'].map(p => {
+          const pd = bpData[p];
+          if (!pd || !pd.mtd) return '';
+          const svcs = (pd.services || []).slice(0, 3).map(s =>
+            `<span style="display:inline-block;margin-right:8px;font-size:10px;color:#64748b;">${s.name} <b>${fmtUsd(s.cost)}</b></span>`
+          ).join('');
+          const delta = pd.delta_pct || 0;
+          const deltaHtml = delta > 0
+            ? `<span style="color:#dc2626;font-size:10px;">▲ ${delta.toFixed(1)}%</span>`
+            : delta < 0
+              ? `<span style="color:#16a34a;font-size:10px;">▼ ${Math.abs(delta).toFixed(1)}%</span>`
+              : `<span style="color:#94a3b8;font-size:10px;">— 0%</span>`;
+          return `
+            <tr style="border-bottom:1px solid #f1f5f9;">
+              <td style="padding:12px 14px;">
+                <div style="font-size:12px;font-weight:700;color:${provColors[p]};">${provLabels[p]}</div>
+                <div style="margin-top:4px;">${svcs || '<span style="font-size:10px;color:#94a3b8;">No services data</span>'}</div>
+              </td>
+              <td style="padding:12px 14px;text-align:right;vertical-align:top;">
+                <div style="font-size:18px;font-weight:700;color:#1a202c;">${fmtUsd(pd.mtd)}</div>
+                <div style="font-size:10px;color:#94a3b8;margin-top:2px;">MTD &nbsp; ${deltaHtml}</div>
+              </td>
+            </tr>`;
+        }).join('');
+
+        return `
+      <!-- CLOUD COST SNAPSHOT -->
+      <tr>
+        <td style="background:#ffffff;padding:28px 44px;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;">
+            <tr>
+              <td><div style="font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:2.5px;">Cloud Cost Snapshot</div></td>
+              <td align="right">
+                <span style="background:#eff6ff;color:#3b82f6;border:1px solid #bfdbfe;padding:3px 12px;border-radius:20px;font-size:11px;font-weight:600;">
+                  MTD Total: ${fmtUsd(billingOverview.total_mtd)}
+                </span>
+              </td>
+            </tr>
+          </table>
+          <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;">
+            ${provRows || '<tr><td style="padding:16px;text-align:center;color:#94a3b8;font-size:12px;">No billing data available</td></tr>'}
+          </table>
+          <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:12px;">
+            <tr>
+              <td style="padding:10px 14px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0;">
+                <table cellpadding="0" cellspacing="0">
+                  <tr>
+                    <td style="padding-right:28px;">
+                      <div style="font-size:10px;color:#94a3b8;">30-Day Forecast</div>
+                      <div style="font-size:15px;font-weight:700;color:#1a202c;">${fmtUsd(billingOverview.forecast_30d)}</div>
+                    </td>
+                    <td style="padding-right:28px;">
+                      <div style="font-size:10px;color:#94a3b8;">Active Services</div>
+                      <div style="font-size:15px;font-weight:700;color:#1a202c;">${billingOverview.active_services || 0}</div>
+                    </td>
+                    <td>
+                      <div style="font-size:10px;color:#94a3b8;">Savings Identified</div>
+                      <div style="font-size:15px;font-weight:700;color:#16a34a;">${fmtUsd(billingOverview.savings_found)}</div>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+
+      <!-- DIVIDER -->
+      <tr><td style="background:#ffffff;padding:0 44px;"><div style="height:1px;background:#f1f5f9;"></div></td></tr>
+        `;
+      })() : ''}
 
       <!-- ACTIVE ALERTS -->
       <tr>
